@@ -1,0 +1,97 @@
+# @synopsis: progress
+# @description: A compact, grouped view of one watcher run (lnav 0.14.1).
+# Indentation denotes ownership, not a stack of balanced start/end events.
+# F5 reruns the query on growing input. The original log remains available with q.
+
+;WITH events AS (
+   SELECT log_line, log_level, fields,
+          json_extract(fields, '$.event') AS event,
+          json_extract(fields, '$.phase') AS phase,
+          json_extract(fields, '$.stage') AS stage,
+          json_extract(logfmt2json(log_text), '$.msg') AS message
+   FROM logfmt_log
+ )
+ SELECT printf('%.1fs', json_extract(fields, '$.elapsed_s')) AS report,
+        CASE WHEN phase IS NOT NULL THEN printf('#%02d', phase) ELSE '' END AS phase,
+        CASE event
+          WHEN 'stage' THEN 'STAGE'
+          WHEN 'stage_summary' THEN 'SUMMARY'
+          WHEN 'phase_start' THEN 'start'
+          WHEN 'phase_active' THEN 'active'
+          WHEN 'phase_end' THEN json_extract(fields, '$.status')
+          WHEN 'phase_unfinished' THEN 'unfinished'
+          WHEN 'db_activity' THEN 'db'
+          WHEN 'restore_totals' THEN 'starts'
+          WHEN 'outcome' THEN upper(json_extract(fields, '$.result'))
+          ELSE event
+        END AS state,
+        CASE
+          WHEN event IN ('stage', 'stage_summary') THEN printf('%d. ', stage)
+          WHEN event IN ('phase_start', 'phase_end', 'phase_active', 'phase_unfinished')
+            THEN '  '
+          WHEN phase IS NOT NULL THEN '    '
+          ELSE ''
+        END ||
+        CASE event
+          WHEN 'db_activity' THEN
+            coalesce(nullif(json_extract(fields, '$.db'), ''),
+                     'oid=' || json_extract(fields, '$.db_oid'), '?') || ': ' ||
+            CASE WHEN json_type(fields, '$.object_starts') = 'integer'
+              THEN printf('%,d starts | ', json_extract(fields, '$.object_starts'))
+              ELSE '' END || message
+          WHEN 'quiet' THEN
+            printf('%.3fs without meaningful log activity',
+                   json_extract(fields, '$.quiet_s')) ||
+            CASE WHEN phase IS NULL THEN ' | ' || message ELSE '' END
+          WHEN 'resumed' THEN
+            printf('Log activity resumed after %.3fs quiet',
+                   json_extract(fields, '$.quiet_s'))
+          WHEN 'restore_totals' THEN
+            printf('%,d object starts (%,d table, %,d constraint, %,d index, %,d other); not completions',
+                   json_extract(fields, '$.object_starts'),
+                   coalesce(json_extract(fields, '$.table_starts'), 0),
+                   coalesce(json_extract(fields, '$.constraint_starts'), 0),
+                   coalesce(json_extract(fields, '$.index_starts'), 0),
+                   coalesce(json_extract(fields, '$.other_starts'), 0))
+          WHEN 'transfer' THEN
+            printf('%,d file-operation messages; not completed files',
+                   json_extract(fields, '$.file_messages'))
+          WHEN 'stage_summary' THEN message ||
+            printf(' [%d/%d phases complete; %s; %d untimed]',
+                   json_extract(fields, '$.complete'), json_extract(fields, '$.phases'),
+                   coalesce(json_extract(fields, '$.timing'), 'unknown'),
+                   json_extract(fields, '$.untimed'))
+          ELSE message
+        END ||
+        CASE
+          WHEN event NOT IN ('phase_end', 'phase_active') THEN ''
+          WHEN json_extract(fields, '$.timing') = 'unknown' THEN ' [duration unknown]'
+          WHEN json_extract(fields, '$.timing') = 'coalesced' THEN ' [coalesced]'
+          WHEN json_type(fields, '$.duration_s') IN ('integer', 'real')
+            THEN printf(' [%.3fs observed]', json_extract(fields, '$.duration_s'))
+          ELSE ''
+        END AS activity,
+        json_object('columns', json_object(
+          'report', json_object('text-align', 'end'),
+          'phase', json_object('text-align', 'start', 'color', 'semantic()'),
+          'state', json_object(
+            'text-align', 'start',
+            'color', CASE
+              WHEN log_level IN ('error', 'critical', 'fatal') THEN '#ff5f5f'
+              WHEN log_level = 'warning' THEN '#d7af00'
+              WHEN event = 'stage' THEN '#5fafff'
+              WHEN json_extract(fields, '$.result') = 'success' THEN '#5faf5f'
+              ELSE 'semantic()' END),
+          'activity', json_object('text-align', 'start')
+        )) AS __lnav_style__
+ FROM events AS e
+ WHERE (event NOT IN ('observer_start', 'notice', 'child_logs', 'last_activity')
+        AND (event <> 'stage_summary'
+          OR EXISTS (SELECT 1 FROM events WHERE event = 'attached')
+          OR NOT EXISTS (
+          SELECT 1 FROM events AS s WHERE s.event = 'stage' AND s.stage = e.stage
+        )))
+    OR log_level IN ('warning', 'error', 'critical', 'fatal')
+ ORDER BY log_line;
+
+:alt-msg q: raw log; F5: refresh. Times = reports; starts != completions; quiet != stalled; coalesced != zero.

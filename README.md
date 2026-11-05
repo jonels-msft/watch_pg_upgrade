@@ -2,81 +2,52 @@
 
 A read-only, log-based progress observer for pg_upgrade.
 
-The script watches an **existing** upgrade's main and per-database logs. It
-reports phase transitions, relevant child activity, and contextual explanations
-of quiet periods as readable logfmt. It never launches pg_upgrade, connects to a
-database, or signals PostgreSQL processes.
+Watches an **existing** upgrade's logs. Never launches pg_upgrade, connects to a
+database, or signals PostgreSQL.
 
-## Requirements
+## TL;DR
 
-- Python 3.8+ with its standard library; no pip packages.
-- Read access to the selected upgrade's English, non-TTY logs.
-- Linux/Unix for the supported operating workflow and tests.
-
-Copy [watch_pg_upgrade.py](watch_pg_upgrade.py) to the machine running the
-upgrade. That single file is all the observer needs. lnav is an optional viewer,
-not a dependency.
+Requires Python 3.8+ on Linux/Unix; no pip packages. lnav 0.14.1 is optional.
+Run from this checkout, selecting the exact upgrade run's log directory:
 
 ```sh
-python3 watch_pg_upgrade.py --help
-```
-
-This is a prototype, not a production-certified monitor. The parser recognizes
-PostgreSQL's English phase framing rather than a stable progress protocol.
-Synthetic compatibility cases cover selected PG16-19 and development-tree
-message variants; they are not full upgrade tests of every version.
-
-## Attach to an upgrade
-
-Select the exact run's timestamped log directory, not a wildcard or a guessed
-newest directory:
-
-```sh
+# Terminal 1: observe and save readable logfmt
 LOGDIR=/path/to/NEW_PGDATA/pg_upgrade_output.d/THIS_RUN_TIMESTAMP/log
+umask 077
 python3 watch_pg_upgrade.py \
   --main-log "$LOGDIR/pg_upgrade_internal.log" \
-  --log-dir "$LOGDIR"
+  --log-dir "$LOGDIR" > "$HOME/pg-upgrade-watch.log" 2>&1
+
+# Terminal 2, from the same checkout: grouped live view
+lnav -I lnav -f lnav/progress.lnav "$HOME/pg-upgrade-watch.log"
 ```
 
-`--main-log` also accepts pg_upgrade stdout/stderr redirected to a regular file.
-Do not pipe pg_upgrade itself through this observer: stopping observation must
-not give the upgrade a broken pipe.
+**F5** refreshes; **q** returns to raw logs. For Snap, replace `lnav` with
+`snap run lnav`. Keep each upgrade in a separate output file.
 
-When attaching after output already exists, earlier timings are unknown.
-Later phases whose starts and ends are observed retain their durations.
-`--once` reads the current state and summarizes without waiting.
-Ctrl-C stops only the observer.
+## Essentials
 
-### pg_upgrade setup tips
+- Run pg_upgrade with **`LC_ALL=C`** and **`--retain`**. `--verbose` is optional.
+  Use regular log files, not terminal transcripts or a pipe from pg_upgrade.
+- **Ctrl-C stops only the observer.** `--once` takes a snapshot; `--help` lists options.
+- **Quiet does not mean stalled.** Counts are log messages, not completed work.
+- Earlier timings are unknown after late attachment. Coalesced means below
+  observation resolution, not zero.
+- For verified completion, add `--exit-file PATH`; your launcher must atomically
+  publish pg_upgrade's actual exit code there. Otherwise its exit is unverified.
 
-- **`--retain`** keeps generated logs after success. Their deletion can
-  interrupt observation; the script rejects disappeared, truncated, or replaced
-  logs instead of inventing progress.
-- **`--verbose` is optional.** It adds dump and file-transfer detail. Main phase
-  messages and verbose pg_restore child logs remain available without it.
-  `--verbose` does not imply `--retain`.
-- **`LC_ALL=C`** ensures English messages.
-- Use redirected output or the internal log, not a terminal transcript with
-  carriage-return updates.
+## Phase timeline
 
-## Reading the output
+```sh
+lnav -I lnav -f lnav/phase-timeline.lnav "$HOME/pg-upgrade-watch.log"
+```
 
-Reports phase changes, child activity, and quiet periods. **Quiet does not mean
-stalled.** Counts are log messages, not completed work.
-
-For verified completion, add `--exit-file PATH`. Your launcher must atomically
-publish pg_upgrade's actual exit code there after it exits; otherwise its exit
-remains unverified.
-
-Output is logfmt: save it to a private file and browse with `lnav watcher.log`.
-No custom format is needed. See `--help` for other options.
+**Enter** focuses a phase's messages. Bars span reports, not execution; labels
+retain observed durations. Rerun this preset after more records arrive.
 
 ## Development
 
-Run from the repository root:
+Tests: `python3 -m unittest discover -s tests`
 
-```sh
-python3 -m unittest discover -s tests
-```
-
-No license has been selected yet.
+Prototype parser for PostgreSQL's English log messages, not a stable progress
+protocol. No license has been selected yet.
