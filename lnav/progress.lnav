@@ -10,31 +10,41 @@
           json_extract(fields, '$.stage') AS stage,
           json_extract(logfmt2json(log_text), '$.msg') AS message
    FROM logfmt_log
+ ),
+ flagged AS (
+   SELECT *,
+          CASE
+            WHEN log_level IN ('error', 'critical', 'fatal')
+              OR (event = 'phase_end' AND (json_extract(fields, '$.status') = 'fatal'
+                  OR json_extract(fields, '$.status') LIKE 'failed%'))
+              OR (event = 'outcome' AND json_extract(fields, '$.result') = 'failed') THEN 'error'
+            WHEN log_level = 'warning' OR event = 'phase_unfinished'
+              OR (event = 'phase_end' AND json_extract(fields, '$.status') IN ('notice', 'warning'))
+              OR (event = 'outcome' AND json_extract(fields, '$.result') IN
+                  ('exit_unverified', 'incomplete', 'missing_banner')) THEN 'warn'
+            ELSE ''
+          END AS alert
+   FROM events
  )
  SELECT printf('%.1fs', json_extract(fields, '$.elapsed_s')) AS report,
         CASE WHEN phase IS NOT NULL THEN printf('#%02d', phase) ELSE '' END AS phase,
-        CASE event
-          WHEN 'stage' THEN 'STAGE'
-          WHEN 'stage_summary' THEN 'SUMMARY'
-          WHEN 'phase_start' THEN 'start'
-          WHEN 'phase_active' THEN 'active'
-          WHEN 'phase_end' THEN json_extract(fields, '$.status')
-          WHEN 'phase_unfinished' THEN 'unfinished'
-          WHEN 'db_activity' THEN 'activity'
-          WHEN 'db_interval' THEN 'timing'
-          WHEN 'context' THEN 'note'
-          WHEN 'restore_totals' THEN 'starts'
-          WHEN 'outcome' THEN upper(json_extract(fields, '$.result'))
-          ELSE event
-        END AS kind,
+        alert,
         CASE
-          WHEN event IN ('stage', 'stage_summary') THEN printf('%d. ', stage)
+          WHEN event = 'stage' THEN printf('Stage %d. ', stage)
+          WHEN event = 'stage_summary' THEN printf('Summary %d. ', stage)
           WHEN event IN ('phase_start', 'phase_end', 'phase_active', 'phase_unfinished')
             THEN '  '
           WHEN phase IS NOT NULL THEN '    '
           ELSE ''
         END ||
         CASE event
+          WHEN 'child_logs' THEN 'Child logs: ' || message
+          WHEN 'phase_active' THEN message || ' [completion not observed]'
+          WHEN 'phase_unfinished' THEN message || ' [completion not observed]'
+          WHEN 'phase_end' THEN message ||
+            CASE WHEN json_extract(fields, '$.status') IS NOT 'ok'
+              THEN ' [' || coalesce(json_extract(fields, '$.status'), 'phase outcome unknown') || ']'
+              ELSE '' END
           WHEN 'db_activity' THEN
             coalesce(nullif(json_extract(fields, '$.db'), ''),
                      'oid=' || json_extract(fields, '$.db_oid'), '?') || ': ' ||
@@ -72,7 +82,7 @@
               ELSE '' END ||
             CASE WHEN phase IS NULL THEN ' | ' || message ELSE '' END
           WHEN 'last_activity' THEN
-            coalesce(nullif(json_extract(fields, '$.db'), ''),
+            'Last log message: ' || coalesce(nullif(json_extract(fields, '$.db'), ''),
                      'oid=' || json_extract(fields, '$.db_oid'), 'main') || ': ' || message
           WHEN 'resumed' THEN
             printf('Log activity resumed after %.3fs quiet',
@@ -111,18 +121,17 @@
           ELSE '' END AS activity,
         json_object('columns', json_object(
           'report', json_object('text-align', 'end'),
-          'phase', json_object('text-align', 'start', 'color', 'semantic()'),
-          'kind', json_object(
-            'text-align', 'start',
-            'color', CASE
-              WHEN log_level IN ('error', 'critical', 'fatal') THEN '#ff5f5f'
-              WHEN log_level = 'warning' THEN '#d7af00'
-              WHEN event = 'stage' THEN '#5fafff'
-              WHEN json_extract(fields, '$.result') = 'success' THEN '#5faf5f'
-              ELSE 'semantic()' END),
+          'phase', json_object('text-align', 'start'),
+          'alert', CASE
+            WHEN alert = 'warn'
+              THEN json_object('text-align', 'start', 'color', '#d7af00')
+            WHEN alert = 'error'
+              THEN json_object('text-align', 'start', 'color', '#ff5f5f')
+            ELSE json_object('text-align', 'start')
+          END,
           'activity', json_object('text-align', 'start')
         )) AS __lnav_style__
- FROM events AS e
+ FROM flagged AS e
  WHERE (event NOT IN ('observer_start', 'notice')
         AND (event <> 'db_interval' OR json_extract(fields, '$.boundary') = 'next_category')
         AND (event <> 'last_activity' OR NOT EXISTS (

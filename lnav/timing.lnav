@@ -254,9 +254,11 @@
             ELSE printf('%.1f%%', 100.0 * p.seconds / t.seconds)
           END AS share,
           '' AS subshare,
-          message AS operation,
-          CASE WHEN state IN ('unfinished', 'unknown') THEN 'warning'
-            ELSE log_level END AS level
+          message || CASE
+            WHEN state IN ('open', 'unfinished') THEN ' [completion not observed]'
+            WHEN state <> 'ok' THEN ' [' || state || ']'
+            ELSE '' END AS operation,
+          log_level AS level
    FROM phases AS p CROSS JOIN totals AS t CROSS JOIN report_clock AS c
    WHERE attention OR p.seconds IS NOT NULL
       OR EXISTS (SELECT 1 FROM windows WHERE phase = p.phase)
@@ -275,7 +277,8 @@
    SELECT 1, -r.seconds, r.id, r.phase,
           CASE WHEN o.id IS NOT NULL THEN '  overlap' ELSE '  window' END,
           printf('%.3fs', r.seconds), '',
-          '  ' || r.operation || CASE WHEN r.phase IS NULL THEN ' [phase unassigned]' ELSE '' END, 'info'
+          '  ' || CASE WHEN o.id IS NOT NULL THEN 'Overlapping observations: ' ELSE '' END ||
+          r.operation || CASE WHEN r.phase IS NULL THEN ' [phase unassigned]' ELSE '' END, 'info'
    FROM ranges AS r LEFT JOIN overlapping AS o ON o.id = r.id
    WHERE NOT EXISTS (SELECT 1 FROM budgets WHERE phase = r.phase)
    UNION ALL
@@ -335,7 +338,7 @@
  view_rows AS (
    SELECT 0 AS section, 0 AS sort_seconds, log_line AS sort_id,
           0 AS detail_order, 0 AS detail_seconds, 0 AS detail_id, NULL AS phase,
-          upper(result) AS kind,
+          result AS kind,
           '' AS elapsed, '' AS share, '' AS subshare,
           message AS operation, log_level AS level
    FROM outcome WHERE log_level IN ('warning', 'error', 'critical', 'fatal')
@@ -355,24 +358,36 @@
    SELECT 0, 0, 0, 0, 0, 0, NULL, 'unmeasured', '', '', '',
           'No measured phase durations in these records.', 'info'
    WHERE NOT EXISTS (SELECT 1 FROM view_rows)
+ ),
+ flagged AS (
+   SELECT *,
+          CASE
+            WHEN level IN ('error', 'critical', 'fatal')
+              OR kind IN ('error', 'critical', 'fatal') OR kind LIKE 'failed%' THEN 'error'
+            WHEN level = 'warning'
+              OR kind IN ('notice', 'warning', 'unfinished', 'exit_unverified',
+                          'incomplete', 'missing_banner') THEN 'warn'
+            ELSE ''
+          END AS alert
+   FROM display_rows
  )
  SELECT CASE WHEN phase IS NULL THEN '' ELSE printf('#%02d', phase) END AS phase,
-        kind, elapsed, share, subshare AS "of phase", operation,
+        alert, elapsed, share, subshare AS "of phase", operation,
         json_object('columns', json_object(
-          'phase', json_object('text-align', 'start', 'color', 'semantic()'),
-          'kind', json_object(
-            'text-align', 'start',
-            'color', CASE
-              WHEN level IN ('error', 'critical', 'fatal') THEN '#ff5f5f'
-              WHEN level = 'warning' THEN '#d7af00'
-              WHEN kind = 'open' THEN '#5fafff'
-              ELSE 'semantic()' END),
+          'phase', json_object('text-align', 'start'),
+          'alert', CASE
+            WHEN alert = 'warn'
+              THEN json_object('text-align', 'start', 'color', '#d7af00')
+            WHEN alert = 'error'
+              THEN json_object('text-align', 'start', 'color', '#ff5f5f')
+            ELSE json_object('text-align', 'start')
+          END,
           'elapsed', json_object('text-align', 'end'),
           'share', json_object('text-align', 'end'),
           'of phase', json_object('text-align', 'end'),
           'operation', json_object('text-align', 'start')
         )) AS __lnav_style__
- FROM display_rows
+ FROM flagged
  ORDER BY section, sort_seconds, sort_id, detail_order, detail_seconds, detail_id;
 
 ;SELECT * FROM temp.watch_pg_upgrade_timing;
