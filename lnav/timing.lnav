@@ -1,8 +1,12 @@
 # @synopsis: timing
 # @description: Rank phases and explain their observed elapsed time (lnav 0.14.1).
 # F5 recomputes the summary. Open-phase ages stop at the last report, not wall time.
+# Keep the displayed query short to avoid lnav navigation lag.
 
-;WITH events AS (
+;DROP VIEW IF EXISTS temp.watch_pg_upgrade_timing;
+
+;CREATE TEMP VIEW watch_pg_upgrade_timing AS
+ WITH events AS (
    SELECT log_line, log_level, fields,
           json_extract(fields, '$.event') AS event,
           CASE WHEN json_type(fields, '$.phase') = 'integer'
@@ -370,5 +374,7 @@
         )) AS __lnav_style__
  FROM display_rows
  ORDER BY section, sort_seconds, sort_id, detail_order, detail_seconds, detail_id;
+
+;SELECT * FROM temp.watch_pg_upgrade_timing;
 
 :alt-msg F5: refresh; q: raw. Share = measured phases; of phase = non-overlapping elapsed portions, NOT SQL runtimes. Windows may overlap.
