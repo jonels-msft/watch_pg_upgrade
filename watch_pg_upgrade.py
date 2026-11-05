@@ -705,11 +705,10 @@ class EventReporter:
         for oid, child in model.children.items():
             for program, observations in child["programs"].items():
                 name = RESTORE if program == "pg_restore" else DUMP
-                number = next((i + 1 for i in reversed(range(len(model.phases)))
-                               if model.phases[i]["name"] == name), None)
-                ended = number is not None and "end_seconds" in model.phases[number - 1]
+                phase = next((p for p in reversed(model.phases) if p["name"] == name), None)
+                ended = phase is not None and "end_seconds" in phase
                 force = final or ended or model.failure or model.banner or model.exit_code is not None
-                key = (oid, program, number)
+                key = (oid, program)
                 previous = self.sent_children.get(key)
                 revision = sum(window["messages"] for window in observations.values())
                 if previous and previous[0] == revision:
@@ -718,20 +717,25 @@ class EventReporter:
                 if force or changed or previous is None or now - previous[1] >= self.activity_interval:
                     last = max(window["seen"] for window in observations.values())
                     pending.append((not force, previous[1] if previous else float("-inf"),
-                                    -last, oid, program, number, observations, revision))
+                                    -last, oid, program, observations, revision))
         pending.sort(key=lambda item: item[:5])
         deferred = 0
         emitted = 0
-        for limited, _, _, oid, program, number, observations, revision in pending:
+        for limited, _, _, oid, program, observations, revision in pending:
             if limited and emitted >= self.max_children:
                 deferred += 1
                 continue
             emitted += 1
             child = model.children[oid]
-            key = (oid, program, number)
+            key = (oid, program)
             for label, window in observations.items():
                 if self.sent_windows.get((key, label)) == window["messages"]:
                     continue
+                number = None
+                if window["first"] is not None and window["last"] is not None:
+                    first_phase = model.child_phase(program, window["first"])
+                    if first_phase == model.child_phase(program, window["last"]):
+                        number = first_phase
                 detail = window["message"]
                 if len(detail) > 160:
                     detail = detail[:157] + "..."
