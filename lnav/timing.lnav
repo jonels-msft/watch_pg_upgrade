@@ -1,0 +1,120 @@
+# @synopsis: timing
+# @description: Rank observed phase durations from one watcher run (lnav 0.14.1).
+# F5 recomputes the summary. Open-phase ages stop at the last report, not wall time.
+
+;WITH events AS (
+   SELECT log_line, log_level,
+          json_extract(fields, '$.event') AS event,
+          CASE WHEN json_type(fields, '$.phase') = 'integer'
+            THEN json_extract(fields, '$.phase') END AS phase,
+          json_extract(fields, '$.status') AS status,
+          json_extract(fields, '$.timing') AS timing,
+          json_extract(fields, '$.result') AS result,
+          json_extract(fields, '$.elapsed_s') AS elapsed_s,
+          json_extract(fields, '$.observed_s') AS observed_s,
+          CASE WHEN json_type(fields, '$.duration_s') IN ('integer', 'real')
+            AND json_extract(fields, '$.duration_s') >= 0
+            THEN json_extract(fields, '$.duration_s') END AS duration_s,
+          json_extract(logfmt2json(log_text), '$.msg') AS message
+   FROM logfmt_log
+ ),
+ boundaries AS (
+   SELECT *,
+          row_number() OVER (PARTITION BY phase ORDER BY log_line DESC) AS latest,
+          max(CASE WHEN event = 'phase_start' AND timing = 'observed'
+            THEN coalesce(observed_s, elapsed_s) END)
+            OVER (PARTITION BY phase) AS start_s
+   FROM events
+   WHERE phase IS NOT NULL AND event IN
+     ('phase_start', 'phase_active', 'phase_end', 'phase_unfinished')
+ ),
+ phases AS (
+   SELECT *,
+          CASE event
+            WHEN 'phase_end' THEN coalesce(status, 'unknown')
+            WHEN 'phase_unfinished' THEN 'unfinished'
+            ELSE 'open'
+          END AS state,
+          CASE WHEN event = 'phase_end' AND timing = 'observed'
+            THEN duration_s END AS seconds,
+          event <> 'phase_end' OR coalesce(status, 'unknown') <> 'ok' AS attention
+   FROM boundaries WHERE latest = 1
+ ),
+ totals AS (
+   SELECT sum(seconds) AS seconds FROM phases
+ ),
+ report_clock AS (
+   SELECT max(elapsed_s) AS elapsed_s FROM events
+ ),
+ outcome AS (
+   SELECT * FROM events WHERE event = 'outcome' ORDER BY log_line DESC LIMIT 1
+ ),
+ alerts AS (
+   SELECT * FROM events
+   WHERE event = 'attached'
+      OR (log_level IN ('warning', 'error', 'critical', 'fatal')
+          AND event NOT IN
+            ('phase_start', 'phase_active', 'phase_end', 'phase_unfinished', 'outcome'))
+ ),
+ phase_rows AS (
+   SELECT CASE WHEN attention THEN 2 ELSE 3 END AS section,
+          CASE WHEN attention THEN 0 ELSE -coalesce(p.seconds, 0) END AS sort_seconds,
+          phase AS sort_id, phase, state,
+          CASE
+            WHEN p.seconds IS NOT NULL THEN printf('%.3fs', p.seconds)
+            WHEN event <> 'phase_end' AND start_s IS NOT NULL AND c.elapsed_s >= start_s
+              THEN printf('%.3fs age', c.elapsed_s - start_s)
+            WHEN event = 'phase_end' AND timing = 'coalesced' THEN 'coalesced'
+            ELSE 'unknown'
+          END AS observed,
+          CASE
+            WHEN p.seconds IS NULL OR t.seconds IS NULL OR t.seconds = 0 THEN '--'
+            WHEN p.seconds > 0 AND 100.0 * p.seconds / t.seconds < 0.1 THEN '<0.1%'
+            ELSE printf('%.1f%%', 100.0 * p.seconds / t.seconds)
+          END AS share,
+          message AS operation,
+          CASE WHEN state IN ('unfinished', 'unknown') THEN 'warning'
+            ELSE log_level END AS level
+   FROM phases AS p CROSS JOIN totals AS t CROSS JOIN report_clock AS c
+   WHERE attention OR p.seconds IS NOT NULL
+ ),
+ view_rows AS (
+   SELECT 0 AS section, 0 AS sort_seconds, log_line AS sort_id, NULL AS phase,
+          upper(result) AS state,
+          '' AS observed, '' AS share,
+          message AS operation, log_level AS level
+   FROM outcome WHERE log_level IN ('warning', 'error', 'critical', 'fatal')
+   UNION ALL
+   SELECT 1, 0, log_line, phase,
+          CASE WHEN event = 'attached' THEN 'attached' ELSE log_level END,
+          '', '', message, log_level
+   FROM alerts
+   UNION ALL
+   SELECT * FROM phase_rows
+ ),
+ display_rows AS (
+   SELECT * FROM view_rows
+   UNION ALL
+   SELECT 0, 0, 0, NULL, 'unmeasured', '', '',
+          'No measured phase durations in these records.', 'info'
+   WHERE NOT EXISTS (SELECT 1 FROM view_rows)
+ )
+ SELECT CASE WHEN phase IS NULL THEN '' ELSE printf('#%02d', phase) END AS phase,
+        state, observed, share, operation,
+        json_object('columns', json_object(
+          'phase', json_object('text-align', 'start', 'color', 'semantic()'),
+          'state', json_object(
+            'text-align', 'start',
+            'color', CASE
+              WHEN level IN ('error', 'critical', 'fatal') THEN '#ff5f5f'
+              WHEN level = 'warning' THEN '#d7af00'
+              WHEN state = 'open' THEN '#5fafff'
+              ELSE 'semantic()' END),
+          'observed', json_object('text-align', 'end'),
+          'share', json_object('text-align', 'end'),
+          'operation', json_object('text-align', 'start')
+        )) AS __lnav_style__
+ FROM display_rows
+ ORDER BY section, sort_seconds, sort_id;
+
+:alt-msg F5: refresh; q: raw. Shares = measured phase time, not progress; untimed omitted; age = last report.

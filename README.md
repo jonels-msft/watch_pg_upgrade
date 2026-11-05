@@ -36,14 +36,18 @@ lnav -I lnav -f lnav/progress.lnav "$HOME/pg-upgrade-watch.log"
 - For verified completion, add `--exit-file PATH`; your launcher must atomically
   publish pg_upgrade's actual exit code there. Otherwise its exit is unverified.
 
-## Phase timeline
+## Timing summary
+
+Use the progress view for activity; use this view to see where measured time went:
 
 ```sh
-lnav -I lnav -f lnav/phase-timeline.lnav "$HOME/pg-upgrade-watch.log"
+lnav -I lnav -f lnav/timing.lnav "$HOME/pg-upgrade-watch.log"
 ```
 
-**Enter** focuses a phase's messages. Bars span reports, not execution; labels
-retain observed durations. Rerun this preset after more records arrive.
+Phases with measured durations are ranked longest first. Open phases and
+warnings/errors stay visible; routine untimed phases are omitted. Shares cover
+measured phase time, not total runtime or percent complete. Open-phase ages stop
+at the last report. **F5** refreshes.
 
 ## Development
 
