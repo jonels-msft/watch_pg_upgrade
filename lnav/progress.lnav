@@ -2,6 +2,7 @@
 # @description: A compact, grouped view of one watcher run (lnav 0.14.1).
 # Indentation denotes ownership, not a stack of balanced start/end events.
 # F5 reruns the query on growing input. The original log remains available with q.
+# Basis describes the text, not the timing; phase names come from logs.
 
 ;WITH events AS (
    SELECT log_line, log_level, fields,
@@ -23,12 +24,29 @@
               OR (event = 'outcome' AND json_extract(fields, '$.result') IN
                   ('exit_unverified', 'incomplete', 'missing_banner')) THEN 'warn'
             ELSE ''
-          END AS alert
+          END AS alert,
+          CASE
+            WHEN event IN ('context', 'notice') THEN 'context'
+            WHEN event IN ('phase_start', 'phase_end', 'phase_active', 'phase_unfinished',
+                           'main_activity', 'last_activity', 'error')
+              OR (event = 'warning' AND json_extract(fields, '$.component') IS NOT 'parser'
+                  AND (json_type(fields, '$.status') = 'text'
+                       OR json_type(fields, '$.program') = 'text')) THEN 'log'
+            ELSE 'derived'
+          END AS basis
    FROM events
+ ),
+ styled AS (
+   SELECT *,
+          CASE alert
+            WHEN 'warn' THEN '{"color":"#d7af00"}'
+            WHEN 'error' THEN '{"color":"#ff5f5f"}'
+            ELSE '{}'
+          END AS row_color
+   FROM flagged
  )
  SELECT printf('%.1fs', json_extract(fields, '$.elapsed_s')) AS report,
         CASE WHEN phase IS NOT NULL THEN printf('#%02d', phase) ELSE '' END AS phase,
-        alert,
         CASE
           WHEN event = 'stage' THEN printf('Stage %d. ', stage)
           WHEN event = 'stage_summary' THEN printf('Summary %d. ', stage)
@@ -38,6 +56,9 @@
           ELSE ''
         END ||
         CASE event
+          WHEN 'warning' THEN 'Warning: ' || message
+          WHEN 'error' THEN 'Error: ' || message
+          WHEN 'observer_error' THEN 'Observer error: ' || message
           WHEN 'child_logs' THEN 'Child logs: ' || message
           WHEN 'phase_active' THEN message || ' [completion not observed]'
           WHEN 'phase_unfinished' THEN message || ' [completion not observed]'
@@ -119,19 +140,14 @@
           THEN printf(' | %,d file-operation messages; not completed files',
                       json_extract(fields, '$.file_messages'))
           ELSE '' END AS activity,
+        basis,
         json_object('columns', json_object(
-          'report', json_object('text-align', 'end'),
-          'phase', json_object('text-align', 'start'),
-          'alert', CASE
-            WHEN alert = 'warn'
-              THEN json_object('text-align', 'start', 'color', '#d7af00')
-            WHEN alert = 'error'
-              THEN json_object('text-align', 'start', 'color', '#ff5f5f')
-            ELSE json_object('text-align', 'start')
-          END,
-          'activity', json_object('text-align', 'start')
+          'report', json_patch('{"text-align":"end"}', row_color),
+          'phase', json_patch('{"text-align":"start"}', row_color),
+          'activity', json_patch('{"text-align":"start"}', row_color),
+          'basis', json_patch('{"text-align":"start"}', row_color)
         )) AS __lnav_style__
- FROM flagged AS e
+ FROM styled AS e
  WHERE (event NOT IN ('observer_start', 'notice')
         AND (event <> 'db_interval' OR json_extract(fields, '$.boundary') = 'next_category')
         AND (event <> 'last_activity' OR NOT EXISTS (

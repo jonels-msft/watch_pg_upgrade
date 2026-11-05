@@ -2,6 +2,7 @@
 # @description: Rank phases and explain their observed elapsed time (lnav 0.14.1).
 # F5 recomputes the summary. Open-phase ages stop at the last report, not wall time.
 # Keep the displayed query short to avoid lnav navigation lag.
+# Basis describes the text, not the timing; phase names come from logs.
 
 ;DROP VIEW IF EXISTS temp.watch_pg_upgrade_timing;
 
@@ -258,7 +259,7 @@
             WHEN state IN ('open', 'unfinished') THEN ' [completion not observed]'
             WHEN state <> 'ok' THEN ' [' || state || ']'
             ELSE '' END AS operation,
-          log_level AS level
+          log_level AS level, 'log' AS basis
    FROM phases AS p CROSS JOIN totals AS t CROSS JOIN report_clock AS c
    WHERE attention OR p.seconds IS NOT NULL
       OR EXISTS (SELECT 1 FROM windows WHERE phase = p.phase)
@@ -271,14 +272,15 @@
           '  ' || r.kind AS kind, printf('%.3fs', r.seconds) AS elapsed,
           CASE WHEN 100.0 * r.seconds / b.seconds < 0.1 THEN '<0.1%'
             ELSE printf('%.1f%%', 100.0 * r.seconds / b.seconds) END AS subshare,
-          '  ' || r.operation AS operation, 'info' AS level
+          '  ' || r.operation AS operation, 'info' AS level, 'derived' AS basis
    FROM ranked_portions AS r JOIN budgets AS b ON b.phase = r.phase
    UNION ALL
    SELECT 1, -r.seconds, r.id, r.phase,
           CASE WHEN o.id IS NOT NULL THEN '  overlap' ELSE '  window' END,
           printf('%.3fs', r.seconds), '',
           '  ' || CASE WHEN o.id IS NOT NULL THEN 'Overlapping observations: ' ELSE '' END ||
-          r.operation || CASE WHEN r.phase IS NULL THEN ' [phase unassigned]' ELSE '' END, 'info'
+          r.operation || CASE WHEN r.phase IS NULL THEN ' [phase unassigned]' ELSE '' END,
+          'info', 'derived'
    FROM ranges AS r LEFT JOIN overlapping AS o ON o.id = r.id
    WHERE NOT EXISTS (SELECT 1 FROM budgets WHERE phase = r.phase)
    UNION ALL
@@ -289,13 +291,14 @@
           '', '  ' || i.db || ': ' || i.label || printf(' [%,d %s]', i.messages,
             CASE WHEN i.messages = 1 THEN rtrim(i.unit, 's') ELSE i.unit END) || i.stopped ||
           CASE WHEN i.phase IS NULL THEN ' [phase unassigned]' ELSE '' END,
-          i.log_level
+          i.log_level, 'derived'
    FROM blocks AS i
    WHERE NOT EXISTS (SELECT 1 FROM budgets WHERE phase = i.phase)
      AND NOT EXISTS (SELECT 1 FROM ranges WHERE id IN (i.log_line * 2, i.log_line * 2 + 1))
    UNION ALL
    SELECT DISTINCT 1, -1e99, 0, phase,
-          '  note', '', '', '  Overlapping log windows below are NOT additive or SQL runtimes.', 'info'
+          '  note', '', '', '  Overlapping log windows below are NOT additive or SQL runtimes.',
+          'info', 'context'
    FROM overlapping
    UNION ALL
    SELECT 1, -coalesce(w.last_s - w.first_s, 0), w.db_oid, w.phase, '  window',
@@ -303,13 +306,14 @@
             WHEN w.last_s > w.first_s THEN printf('%.3fs', w.last_s - w.first_s)
             WHEN w.messages = 1 THEN 'single message' ELSE 'below resolution' END,
           '', '  ' || w.db || ': ' || w.activity || printf(' [%,d %s; legacy window]', w.messages, w.unit),
-          'info'
+          'info', 'derived'
    FROM windows AS w
    UNION ALL
    SELECT 1, -(coalesce(b.observed_s, b.elapsed_s) - t.last_s), 0, t.phase, '  quiet',
           printf('%.3fs',
                  coalesce(b.observed_s, b.elapsed_s) - t.last_s), '',
-          '  Silent tail: no further ' || t.program || ' messages before phase completion', 'info'
+          '  Silent tail: no further ' || t.program || ' messages before phase completion',
+          'info', 'derived'
    FROM tails AS t JOIN phases AS b ON b.phase = t.phase
    WHERE b.event = 'phase_end' AND b.timing = 'observed'
      AND t.last_s IS NOT NULL AND coalesce(b.observed_s, b.elapsed_s) > t.last_s
@@ -317,7 +321,8 @@
    UNION ALL
    SELECT 1, -json_extract(q.fields, '$.quiet_s'), 0, q.phase, '  quiet',
           printf('%.3fs', json_extract(q.fields, '$.quiet_s')), '',
-          printf('  No meaningful main/child activity at report %.3fs', q.elapsed_s), 'info'
+          printf('  No meaningful main/child activity at report %.3fs', q.elapsed_s),
+          'info', 'derived'
    FROM quiet_reports AS q JOIN phases AS b ON b.phase = q.phase
    WHERE b.event <> 'phase_end' AND q.latest = 1 AND q.event = 'quiet'
    UNION ALL
@@ -325,14 +330,15 @@
           '  ' || CASE WHEN d.detail = 'files'
             THEN printf('%,d file-operation messages; not completed files.',
                         json_extract(d.fields, '$.file_messages'))
-            ELSE 'Last main-log detail: ' || d.message END, d.log_level
+            ELSE 'Last main-log detail: ' || d.message END, d.log_level,
+          CASE WHEN d.detail = 'main' THEN 'log' ELSE 'derived' END
    FROM main_details AS d
    WHERE d.latest = 1
  ),
  child_rows AS (
    SELECT coalesce(p.section, 2) AS section, coalesce(p.sort_seconds, 0) AS sort_seconds,
           d.phase AS sort_id, d.detail_order, d.detail_seconds, d.detail_id,
-          d.phase, d.kind, d.elapsed, '' AS share, d.subshare, d.operation, d.level
+          d.phase, d.kind, d.elapsed, '' AS share, d.subshare, d.operation, d.level, d.basis
    FROM child_details AS d LEFT JOIN phase_rows AS p ON p.phase = d.phase
  ),
  view_rows AS (
@@ -340,12 +346,26 @@
           0 AS detail_order, 0 AS detail_seconds, 0 AS detail_id, NULL AS phase,
           result AS kind,
           '' AS elapsed, '' AS share, '' AS subshare,
-          message AS operation, log_level AS level
+          message AS operation, log_level AS level, 'derived' AS basis
    FROM outcome WHERE log_level IN ('warning', 'error', 'critical', 'fatal')
    UNION ALL
    SELECT 1, 0, log_line, 0, 0, 0, phase,
           CASE WHEN event = 'attached' THEN 'attached' ELSE log_level END,
-          '', '', '', message, log_level
+          '', '', '',
+          CASE event
+            WHEN 'warning' THEN 'Warning: ' || message
+            WHEN 'error' THEN 'Error: ' || message
+            WHEN 'observer_error' THEN 'Observer error: ' || message
+            ELSE message
+          END, log_level,
+          CASE
+            WHEN event IN ('context', 'notice') THEN 'context'
+            WHEN event IN ('main_activity', 'last_activity', 'error')
+              OR (event = 'warning' AND json_extract(fields, '$.component') IS NOT 'parser'
+                  AND (json_type(fields, '$.status') = 'text'
+                       OR json_type(fields, '$.program') = 'text')) THEN 'log'
+            ELSE 'derived'
+          END
    FROM alerts
    UNION ALL
    SELECT * FROM phase_rows
@@ -356,7 +376,7 @@
    SELECT * FROM view_rows
    UNION ALL
    SELECT 0, 0, 0, 0, 0, 0, NULL, 'unmeasured', '', '', '',
-          'No measured phase durations in these records.', 'info'
+          'No measured phase durations in these records.', 'info', 'derived'
    WHERE NOT EXISTS (SELECT 1 FROM view_rows)
  ),
  flagged AS (
@@ -370,24 +390,27 @@
             ELSE ''
           END AS alert
    FROM display_rows
+ ),
+ styled AS (
+   SELECT *,
+          CASE alert
+            WHEN 'warn' THEN '{"color":"#d7af00"}'
+            WHEN 'error' THEN '{"color":"#ff5f5f"}'
+            ELSE '{}'
+          END AS row_color
+   FROM flagged
  )
  SELECT CASE WHEN phase IS NULL THEN '' ELSE printf('#%02d', phase) END AS phase,
-        alert, elapsed, share, subshare AS "of phase", operation,
+        elapsed, share, subshare AS "of phase", operation, basis,
         json_object('columns', json_object(
-          'phase', json_object('text-align', 'start'),
-          'alert', CASE
-            WHEN alert = 'warn'
-              THEN json_object('text-align', 'start', 'color', '#d7af00')
-            WHEN alert = 'error'
-              THEN json_object('text-align', 'start', 'color', '#ff5f5f')
-            ELSE json_object('text-align', 'start')
-          END,
-          'elapsed', json_object('text-align', 'end'),
-          'share', json_object('text-align', 'end'),
-          'of phase', json_object('text-align', 'end'),
-          'operation', json_object('text-align', 'start')
+          'phase', json_patch('{"text-align":"start"}', row_color),
+          'elapsed', json_patch('{"text-align":"end"}', row_color),
+          'share', json_patch('{"text-align":"end"}', row_color),
+          'of phase', json_patch('{"text-align":"end"}', row_color),
+          'operation', json_patch('{"text-align":"start"}', row_color),
+          'basis', json_patch('{"text-align":"start"}', row_color)
         )) AS __lnav_style__
- FROM flagged
+ FROM styled
  ORDER BY section, sort_seconds, sort_id, detail_order, detail_seconds, detail_id;
 
 ;SELECT * FROM temp.watch_pg_upgrade_timing;
