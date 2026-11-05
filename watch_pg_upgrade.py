@@ -220,6 +220,7 @@ class Timeline(PhaseTimer):
         self.children = {}
         self.parent_last = None
         self.last_detail = ""
+        self.last_detail_s = None
         self.last_warning = ""
         self.timing_complete = True
         self.finished_at = None
@@ -229,6 +230,8 @@ class Timeline(PhaseTimer):
         self.events = []
         self.alerts = []
         self.file_activity = {}
+        self.main_activity = {}
+        self.intervals = []
 
     def emit(self, seconds, utc, kind, message):
         if kind == "START":
@@ -259,6 +262,7 @@ class Timeline(PhaseTimer):
                 self.failure = f"{self.last_detail}; {text}" if self.last_detail else text
             if text and not text.startswith(("executing:", '"', "command:")):
                 self.last_detail = text
+                self.last_detail_s = seconds
             if text:
                 self.parent_activity = seconds
             if self.active is not None and FILE_OPERATION.match(text):
@@ -266,6 +270,10 @@ class Timeline(PhaseTimer):
                                                          {"count": 0, "last": seconds})
                 activity["count"] += 1
                 activity["last"] = seconds
+            elif text and self.active is not None:
+                activity = self.main_activity.setdefault(len(self.phases), {"count": 0})
+                activity.update(last=seconds, message=text)
+                activity["count"] += 1
         if kind in ("START", "END"):
             self.parent_activity = seconds
             if not self.reading_history:
@@ -286,25 +294,35 @@ class Timeline(PhaseTimer):
         match = CHILD_NAME.fullmatch(Path(source).name)
         if match is None:
             raise ValueError(f"Unrecognized child log source: {source}")
+        if not isinstance(seconds, (int, float)) or not math.isfinite(seconds) or seconds < 0:
+            raise ValueError("Child observation timestamps must be finite and nonnegative")
         oid = match.group(1)
         child = self.children.setdefault(oid, {
             "source": source, "pending": "", "last": seconds, "message": "",
             "counts": Counter(), "restore_seen": False, "error": None,
             "activity_last": None, "revision": 0, "program": None, "name": None,
-            "milestones": set(),
+            "milestones": set(), "programs": {},
+            "interval": None, "interval_id": 0, "pending_history": False,
         })
         if child["source"] != source:
             raise ValueError(f"More than one run contains database OID {oid}")
+        if seconds < child["last"]:
+            raise ValueError(f"Child observation timestamps moved backwards: {source}")
+        pending_history = child["pending_history"]
         child["pending"] += text
         if text:
             child["last"] = seconds
         lines = child["pending"].split("\n")
         child["pending"] = lines.pop()
+        child["pending_history"] = bool(child["pending"]) and (
+            self.reading_history or (pending_history and not lines))
         if len(child["pending"]) > MAX_LINE:
             raise ValueError("Child log line exceeds 1 MiB")
-        for line in lines:
+        for index, line in enumerate(lines):
+            historical = self.reading_history or (index == 0 and pending_history)
             line = SGR.sub("", line)
             if line.startswith("command:"):
+                self.finish_interval(child, "command")
                 names = {next(value for value in match if value)
                          for match in DB_NAME.findall(line)}
                 if len(names) == 1:
@@ -313,11 +331,22 @@ class Timeline(PhaseTimer):
                         raise ValueError(f"Conflicting database names in child log for OID {oid}")
                     child["name"] = name
             if not line.startswith(("pg_restore:", "pg_dump:")):
+                if line.strip():
+                    self.finish_interval(child, "unrecognized_output")
                 continue
             child["message"] = line
             child["activity_last"] = seconds
             child["revision"] += 1
             child["program"] = line.split(":", 1)[0]
+            detail = line.split(": ", 1)[-1]
+            self.observe_interval(child, oid, detail, seconds, historical)
+            observations = child["programs"].setdefault(child["program"], {})
+            window = observations.setdefault(activity_label(detail), {
+                "first": None if historical else seconds, "messages": 0,
+            })
+            window.update(last=None if historical else seconds,
+                          seen=seconds, message=detail)
+            window["messages"] += 1
             if line.startswith("pg_restore:"):
                 child["restore_seen"] = True
             if line.startswith(("pg_restore: error:", "pg_dump: error:")):
@@ -335,6 +364,51 @@ class Timeline(PhaseTimer):
                     child["milestones"].add(kind)
             elif line.startswith("pg_restore: processing data for table "):
                 child["milestones"].add("DATA")
+
+    def child_phase(self, program, seconds):
+        name = RESTORE if program == "pg_restore" else DUMP
+        candidates = [(i + 1, phase) for i, phase in enumerate(self.phases)
+                      if phase["name"] == name]
+        if len(candidates) != 1:
+            return None
+        number, phase = candidates[0]
+        if seconds < phase["start_seconds"] or seconds > phase.get("end_seconds", seconds):
+            return None
+        return number
+
+    def finish_interval(self, child, boundary, **fields):
+        if child["interval"] is not None:
+            self.intervals.append(dict(child["interval"], boundary=boundary, **fields))
+            child["interval"] = None
+
+    def observe_interval(self, child, oid, message, seconds, historical):
+        program = child["program"]
+        label = activity_label(message)
+        if program == "pg_restore" and label not in (
+            "creating TABLE", "creating CONSTRAINT", "creating INDEX", "processing table data",
+            "error", "warning",
+        ):
+            label = "other restore messages"
+        number = self.child_phase(program, seconds)
+        current = child["interval"]
+        if current and current["program"] != program:
+            self.finish_interval(child, "program")
+        elif current and current["phase"] != number:
+            self.finish_interval(child, "phase_association")
+        elif current and current["from_activity"] != label:
+            self.finish_interval(child, "next_category", to_activity=label,
+                                 to_s=None if historical else seconds)
+        if child["interval"] is None:
+            child["interval_id"] += 1
+            child["interval"] = {
+                "source": child["source"], "db_oid": int(oid), "program": program,
+                "phase": number, "interval_id": child["interval_id"],
+                "from_activity": label, "first_s": None if historical else seconds,
+                "messages": 0, "boundary": "unreported",
+            }
+        current = child["interval"]
+        current["last_s"] = None if historical else seconds
+        current["messages"] += 1
 
     def result(self):
         if self.failure or (self.exit_code is not None and self.exit_code != 0):
@@ -455,6 +529,27 @@ def counts_fields(counts):
     return fields
 
 
+def activity_label(message):
+    if message.startswith("processing data for table "):
+        return "processing table data"
+    for prefix in ("dropping ", "executing ", "disabling triggers ", "enabling triggers "):
+        if message.startswith(prefix):
+            return prefix.strip()
+    if message.startswith(("error:", "warning:")):
+        return message.split(":", 1)[0]
+    return re.split(r"""["']|\b\d+\b""", message, maxsplit=1)[0].rstrip(": ")
+
+
+def observation_label(activity):
+    if activity.startswith("creating "):
+        return activity[len("creating "):] + " announcement"
+    if activity == "processing table data":
+        return "table-data announcement"
+    if activity == "other restore messages":
+        return "other restore message"
+    return activity + " message"
+
+
 def relevant_children(model):
     name = model.active["name"] if model.active else ""
     program = "pg_restore" if name == RESTORE else "pg_dump" if name == DUMP else None
@@ -521,7 +616,11 @@ class EventReporter:
         self.finished = False
         self.group = None
         self.sent_children = {}
+        self.sent_windows = {}
         self.sent_files = {}
+        self.sent_main = {}
+        self.sent_restore_totals = None
+        self.sent_intervals = {}
         self.alerted = set()
         self.quiet_key = None
         self.last_activity = 0
@@ -596,42 +695,71 @@ class EventReporter:
                 level = ("info" if phase["status"] == "ok" else
                          "warning" if phase["status"] in ("notice", "warning") else "error")
                 self.write(seconds, "phase_end", phase["name"], level=level, **fields)
-                if phase["name"] == RESTORE:
-                    counts = Counter()
-                    for child in model.children.values():
-                        counts.update(child["counts"])
-                    if counts:
-                        self.write(seconds, "restore_totals", "Object-start messages, not completions",
-                                   phase=number + 1, **counts_fields(counts))
             if group is None:
                 self.write(seconds, "warning", "Unclassified phase: expected stage sequence may be incomplete.",
                            level="warning", phase=number + 1)
             index += 1
 
-    def activity(self, model, now, children):
+    def activity(self, model, now, *, final=False):
         pending = []
-        for oid, child in children.items():
-            key = (oid, child["program"])
-            previous = self.sent_children.get(key)
-            if previous and previous[0] == child["revision"]:
+        for oid, child in model.children.items():
+            for program, observations in child["programs"].items():
+                name = RESTORE if program == "pg_restore" else DUMP
+                number = next((i + 1 for i in reversed(range(len(model.phases)))
+                               if model.phases[i]["name"] == name), None)
+                ended = number is not None and "end_seconds" in model.phases[number - 1]
+                force = final or ended or model.failure or model.banner or model.exit_code is not None
+                key = (oid, program, number)
+                previous = self.sent_children.get(key)
+                revision = sum(window["messages"] for window in observations.values())
+                if previous and previous[0] == revision:
+                    continue
+                changed = any((key, label) not in self.sent_windows for label in observations)
+                if force or changed or previous is None or now - previous[1] >= self.activity_interval:
+                    last = max(window["seen"] for window in observations.values())
+                    pending.append((not force, previous[1] if previous else float("-inf"),
+                                    -last, oid, program, number, observations, revision))
+        pending.sort(key=lambda item: item[:5])
+        deferred = 0
+        emitted = 0
+        for limited, _, _, oid, program, number, observations, revision in pending:
+            if limited and emitted >= self.max_children:
+                deferred += 1
                 continue
-            milestone = previous is None or bool(child["milestones"] - previous[2])
-            if milestone or now - previous[1] >= self.activity_interval:
-                pending.append((oid, child, key, previous[1] if previous else float("-inf")))
-        pending.sort(key=lambda item: (item[3], -item[1]["activity_last"], item[0]))
-        for oid, child, key, _ in pending[:self.max_children]:
-            detail = child["message"].split(": ", 1)[-1]
-            if len(detail) > 160:
-                detail = detail[:157] + "..."
-            counts = counts_fields(child["counts"]) if child["program"] == "pg_restore" else {}
-            self.write(child["activity_last"], "db_activity", detail,
-                       phase=len(model.phases), db=child["name"], db_oid=int(oid),
-                       program=child["program"], **counts)
-            self.sent_children[key] = (child["revision"], now, set(child["milestones"]))
-        if len(pending) > self.max_children:
+            emitted += 1
+            child = model.children[oid]
+            key = (oid, program, number)
+            for label, window in observations.items():
+                if self.sent_windows.get((key, label)) == window["messages"]:
+                    continue
+                detail = window["message"]
+                if len(detail) > 160:
+                    detail = detail[:157] + "..."
+                counts = counts_fields(child["counts"]) if program == "pg_restore" else {}
+                self.write(window["seen"], "db_activity", detail, phase=number,
+                           db=child["name"], db_oid=int(oid), program=program,
+                           source=child["source"], activity=label,
+                           activity_messages=window["messages"],
+                           activity_unit=("starts" if program == "pg_restore"
+                                          and label.startswith("creating ") else "messages"),
+                           timing="observed" if window["first"] is not None else "unknown",
+                           first_s=window["first"], last_s=window["last"], **counts)
+                self.sent_windows[(key, label)] = window["messages"]
+            self.sent_children[key] = (revision, now)
+        if deferred:
             self.write(now, "activity_deferred", "Additional changed database logs; "
                        "details deferred, errors are never hidden.",
-                       databases=len(pending) - self.max_children)
+                       databases=deferred)
+        for number, detail in model.main_activity.items():
+            previous = self.sent_main.get(number)
+            ended = "end_seconds" in model.phases[number - 1]
+            force = ended or final or model.failure or model.banner or model.exit_code is not None
+            if previous and (previous[0] == detail["count"] or
+                             not force and now - previous[1] < self.activity_interval):
+                continue
+            self.write(detail["last"], "main_activity", detail["message"][:160],
+                       phase=number, source="main", messages=detail["count"])
+            self.sent_main[number] = (detail["count"], now)
         number = len(model.phases) - 1
         activity = model.file_activity.get(number) if model.active else None
         if activity:
@@ -641,6 +769,16 @@ class EventReporter:
                 self.write(activity["last"], "transfer", "File-operation messages, not completed files or bytes",
                            phase=number + 1, file_messages=activity["count"])
                 self.sent_files[number] = (activity["count"], now)
+        restore = next((i for i in reversed(range(len(model.phases)))
+                        if model.phases[i]["name"] == RESTORE), None)
+        if restore is not None and "end_seconds" in model.phases[restore]:
+            counts = Counter()
+            for child in model.children.values():
+                counts.update(child["counts"])
+            if counts and counts != self.sent_restore_totals:
+                self.write(now, "restore_totals", "Object-start messages, not completions",
+                           phase=restore + 1, **counts_fields(counts))
+                self.sent_restore_totals = counts
 
     def quiet(self, model, now, children):
         key = (len(model.phases), model.active is not None)
@@ -669,9 +807,18 @@ class EventReporter:
         if self.last_quiet is not None and now - self.last_quiet < self.heartbeat:
             return
         raw = max([model.parent_last or 0] + [child["last"] for child in children.values()])
+        latest = max(children.items(), key=lambda item: item[1]["activity_last"]) if children else None
+        detail = {}
+        if latest and latest[1]["activity_last"] >= (model.parent_activity or boundary):
+            oid, child = latest
+            detail = {"db": child["name"], "db_oid": int(oid), "program": child["program"],
+                      "last_message": child["message"].split(": ", 1)[-1][:160],
+                      "source": child["source"]}
+        elif model.last_detail and model.last_detail_s == model.parent_activity:
+            detail = {"last_message": model.last_detail[:160], "source": "main"}
         self.write(now, "quiet", label, quiet_s=now - activity,
                    phase=len(model.phases) if model.active else None,
-                   bytes_ago_s=now - raw if raw > activity else None)
+                   bytes_ago_s=now - raw if raw > activity else None, **detail)
         if self.last_quiet is None:
             if children:
                 oid, child = max(children.items(), key=lambda item: item[1]["activity_last"])
@@ -680,6 +827,46 @@ class EventReporter:
             self.write(now, "context", quiet_context(model, children),
                        phase=len(model.phases) if model.active else None)
         self.last_quiet = now
+
+    def correlations(self, model, now, final):
+        closed, model.intervals = model.intervals, []
+        current = [child["interval"] for child in model.children.values()
+                   if child["interval"] is not None]
+        for interval in closed + current:
+            key = (interval["source"], interval["interval_id"])
+            signature = (interval["messages"], interval["boundary"])
+            previous = self.sent_intervals.get(key)
+            number = interval["phase"]
+            ended = number is not None and "end_seconds" in model.phases[number - 1]
+            force = (interval["boundary"] != "unreported" or final or ended
+                     or model.failure or model.banner or model.exit_code is not None)
+            if previous and (previous[0] == signature or
+                             not force and now - previous[1] < self.activity_interval):
+                continue
+            first = interval["first_s"]
+            stop = interval.get("to_s") if interval["boundary"] == "next_category" else interval["last_s"]
+            elapsed = None if first is None or stop is None else stop - first
+            timing = ("unknown" if elapsed is None else
+                      "observed" if round(elapsed, 3) > 0 else "coalesced")
+            fields = dict(interval, timing=timing, basis="log_observations")
+            fields["activity_unit"] = ("starts" if interval["program"] == "pg_restore"
+                                       and interval["from_activity"].startswith("creating ")
+                                       else "messages")
+            if timing == "observed":
+                fields["interval_s" if interval["boundary"] == "next_category"
+                       else "message_span_s"] = elapsed
+            child = model.children[str(interval["db_oid"])]
+            label = observation_label(interval["from_activity"])
+            if interval["boundary"] == "next_category":
+                message = "First " + label + " -> next " + observation_label(interval["to_activity"])
+            else:
+                message = "First -> last " + label
+            self.write(stop if stop is not None else now, "db_interval", message,
+                       db=child["name"], **fields)
+            if interval["boundary"] == "unreported":
+                self.sent_intervals[key] = (signature, now)
+            else:
+                self.sent_intervals.pop(key, None)
 
     def outcome(self, model, now, final):
         result = model.result()
@@ -717,6 +904,8 @@ class EventReporter:
             self.write(now, "child_logs", model.child_location)
             self.location = model.child_location
         self.phase_events(model)
+        self.activity(model, now, final=final)
+        self.correlations(model, now, final)
         alerts, model.alerts = model.alerts, []
         if model.failure:
             alerts.append((now, "error", model.failure, {}))
@@ -729,7 +918,6 @@ class EventReporter:
             if model.active and not (model.failure or model.banner or model.exit_code is not None):
                 children = relevant_children(model)
                 self.quiet(model, now, children)
-                self.activity(model, now, children)
             self.summary(model, now)
             return
         if model.banner or model.failure or model.exit_code is not None:
@@ -740,7 +928,6 @@ class EventReporter:
             return
         children = relevant_children(model)
         self.quiet(model, now, children)
-        self.activity(model, now, children)
         if self.references:
             eta, fields = estimate_details(model, now, self.references)
             state = (fields["available"], fields.get("reason"))

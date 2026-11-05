@@ -20,11 +20,13 @@
           WHEN 'phase_active' THEN 'active'
           WHEN 'phase_end' THEN json_extract(fields, '$.status')
           WHEN 'phase_unfinished' THEN 'unfinished'
-          WHEN 'db_activity' THEN 'db'
+          WHEN 'db_activity' THEN 'activity'
+          WHEN 'db_interval' THEN 'timing'
+          WHEN 'context' THEN 'note'
           WHEN 'restore_totals' THEN 'starts'
           WHEN 'outcome' THEN upper(json_extract(fields, '$.result'))
           ELSE event
-        END AS state,
+        END AS kind,
         CASE
           WHEN event IN ('stage', 'stage_summary') THEN printf('%d. ', stage)
           WHEN event IN ('phase_start', 'phase_end', 'phase_active', 'phase_unfinished')
@@ -36,16 +38,46 @@
           WHEN 'db_activity' THEN
             coalesce(nullif(json_extract(fields, '$.db'), ''),
                      'oid=' || json_extract(fields, '$.db_oid'), '?') || ': ' ||
-            CASE WHEN json_type(fields, '$.object_starts') = 'integer'
+            CASE WHEN json_type(fields, '$.activity_messages') = 'integer'
+              THEN printf('%,d %s | ',
+                     json_extract(fields, '$.activity_messages'),
+                     CASE WHEN json_extract(fields, '$.activity_messages') = 1
+                       THEN rtrim(json_extract(fields, '$.activity_unit'), 's')
+                       ELSE json_extract(fields, '$.activity_unit') END)
+              WHEN json_type(fields, '$.object_starts') = 'integer'
               THEN printf('%,d starts | ', json_extract(fields, '$.object_starts'))
               ELSE '' END || message
+          WHEN 'db_interval' THEN
+            coalesce(nullif(json_extract(fields, '$.db'), ''),
+                     'oid=' || json_extract(fields, '$.db_oid'), '?') || ': ' || message ||
+            CASE
+              WHEN json_extract(fields, '$.timing') = 'unknown' THEN ' [elapsed unknown]'
+              WHEN json_extract(fields, '$.timing') = 'coalesced'
+                THEN ' [elapsed below observation resolution]'
+              ELSE printf(' [%.3fs between log observations]',
+                          json_extract(fields, '$.interval_s'))
+            END
           WHEN 'quiet' THEN
             printf('%.3fs without meaningful log activity',
                    json_extract(fields, '$.quiet_s')) ||
+            CASE WHEN json_extract(fields, '$.last_message') IS NOT NULL
+              THEN ' | last: ' ||
+                coalesce(nullif(json_extract(fields, '$.db'), ''),
+                         'oid=' || json_extract(fields, '$.db_oid'),
+                         json_extract(fields, '$.source'), '') || ': ' ||
+                json_extract(fields, '$.last_message')
+              ELSE '' END ||
+            CASE WHEN json_extract(fields, '$.bytes_ago_s') IS NOT NULL
+              THEN printf(' | raw bytes %.3fs ago', json_extract(fields, '$.bytes_ago_s'))
+              ELSE '' END ||
             CASE WHEN phase IS NULL THEN ' | ' || message ELSE '' END
+          WHEN 'last_activity' THEN
+            coalesce(nullif(json_extract(fields, '$.db'), ''),
+                     'oid=' || json_extract(fields, '$.db_oid'), 'main') || ': ' || message
           WHEN 'resumed' THEN
             printf('Log activity resumed after %.3fs quiet',
                    json_extract(fields, '$.quiet_s'))
+          WHEN 'context' THEN 'Possible unlogged work: ' || message
           WHEN 'restore_totals' THEN
             printf('%,d object starts (%,d table, %,d constraint, %,d index, %,d other); not completions',
                    json_extract(fields, '$.object_starts'),
@@ -64,17 +96,23 @@
           ELSE message
         END ||
         CASE
+          WHEN event = 'db_activity' AND json_extract(fields, '$.timing') = 'unknown'
+            THEN ' [earlier timing unknown]'
           WHEN event NOT IN ('phase_end', 'phase_active') THEN ''
           WHEN json_extract(fields, '$.timing') = 'unknown' THEN ' [duration unknown]'
           WHEN json_extract(fields, '$.timing') = 'coalesced' THEN ' [coalesced]'
           WHEN json_type(fields, '$.duration_s') IN ('integer', 'real')
             THEN printf(' [%.3fs observed]', json_extract(fields, '$.duration_s'))
           ELSE ''
-        END AS activity,
+        END ||
+        CASE WHEN event = 'phase_end' AND json_type(fields, '$.file_messages') = 'integer'
+          THEN printf(' | %,d file-operation messages; not completed files',
+                      json_extract(fields, '$.file_messages'))
+          ELSE '' END AS activity,
         json_object('columns', json_object(
           'report', json_object('text-align', 'end'),
           'phase', json_object('text-align', 'start', 'color', 'semantic()'),
-          'state', json_object(
+          'kind', json_object(
             'text-align', 'start',
             'color', CASE
               WHEN log_level IN ('error', 'critical', 'fatal') THEN '#ff5f5f'
@@ -85,7 +123,13 @@
           'activity', json_object('text-align', 'start')
         )) AS __lnav_style__
  FROM events AS e
- WHERE (event NOT IN ('observer_start', 'notice', 'child_logs', 'last_activity')
+ WHERE (event NOT IN ('observer_start', 'notice')
+        AND (event <> 'db_interval' OR json_extract(fields, '$.boundary') = 'next_category')
+        AND (event <> 'last_activity' OR NOT EXISTS (
+          SELECT 1 FROM events AS q WHERE q.event = 'quiet'
+            AND json_extract(q.fields, '$.elapsed_s') = json_extract(e.fields, '$.elapsed_s')
+            AND json_extract(q.fields, '$.last_message') IS NOT NULL
+        ))
         AND (event <> 'stage_summary'
           OR EXISTS (SELECT 1 FROM events WHERE event = 'attached')
           OR NOT EXISTS (
