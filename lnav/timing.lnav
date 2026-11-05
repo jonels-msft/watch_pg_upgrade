@@ -1,9 +1,9 @@
 # @synopsis: timing
-# @description: Rank observed phase durations from one watcher run (lnav 0.14.1).
+# @description: Rank phases and explain their observed elapsed time (lnav 0.14.1).
 # F5 recomputes the summary. Open-phase ages stop at the last report, not wall time.
 
 ;WITH events AS (
-   SELECT log_line, log_level,
+   SELECT log_line, log_level, fields,
           json_extract(fields, '$.event') AS event,
           CASE WHEN json_type(fields, '$.phase') = 'integer'
             THEN json_extract(fields, '$.phase') END AS phase,
@@ -22,7 +22,8 @@
    SELECT *,
           row_number() OVER (PARTITION BY phase ORDER BY log_line DESC) AS latest,
           max(CASE WHEN event = 'phase_start' AND timing = 'observed'
-            THEN coalesce(observed_s, elapsed_s) END)
+            THEN coalesce(observed_s, elapsed_s)
+            WHEN event = 'phase_end' THEN json_extract(fields, '$.start_s') END)
             OVER (PARTITION BY phase) AS start_s
    FROM events
    WHERE phase IS NOT NULL AND event IN
@@ -46,6 +47,10 @@
  report_clock AS (
    SELECT max(elapsed_s) AS elapsed_s FROM events
  ),
+ quiet_reports AS (
+   SELECT *, row_number() OVER (PARTITION BY phase ORDER BY log_line DESC) AS latest
+   FROM events WHERE event IN ('quiet', 'resumed') AND phase IS NOT NULL
+ ),
  outcome AS (
    SELECT * FROM events WHERE event = 'outcome' ORDER BY log_line DESC LIMIT 1
  ),
@@ -56,65 +61,314 @@
           AND event NOT IN
             ('phase_start', 'phase_active', 'phase_end', 'phase_unfinished', 'outcome'))
  ),
+ interval_events AS (
+   SELECT *,
+          json_extract(fields, '$.db_oid') AS db_oid,
+          json_extract(fields, '$.program') AS program,
+          json_extract(fields, '$.interval_id') AS interval_id,
+          json_extract(fields, '$.boundary') AS boundary,
+          row_number() OVER (
+            PARTITION BY json_extract(fields, '$.source'), json_extract(fields, '$.interval_id')
+            ORDER BY log_line DESC) AS latest
+   FROM events WHERE event = 'db_interval'
+ ),
+ correlated AS (
+   SELECT * FROM interval_events WHERE latest = 1
+ ),
+ child_latest AS (
+   SELECT *,
+          json_extract(fields, '$.db_oid') AS db_oid,
+          json_extract(fields, '$.program') AS program,
+          json_extract(fields, '$.activity') AS activity,
+          row_number() OVER (
+            PARTITION BY json_extract(fields, '$.db_oid'),
+                         json_extract(fields, '$.program'), json_extract(fields, '$.activity')
+            ORDER BY log_line DESC) AS latest
+   FROM events WHERE event = 'db_activity'
+     AND json_type(fields, '$.activity_messages') = 'integer'
+ ),
+ child_groups AS (
+   SELECT phase, db_oid, program,
+          coalesce(nullif(json_extract(fields, '$.db'), ''), 'oid=' || db_oid) AS db,
+          CASE WHEN program = 'pg_restore' AND activity NOT IN
+                 ('creating TABLE', 'creating CONSTRAINT', 'creating INDEX', 'processing table data')
+            THEN 'other restore messages' ELSE activity END AS activity,
+          CASE WHEN program = 'pg_restore'
+                 AND activity IN ('creating TABLE', 'creating CONSTRAINT', 'creating INDEX')
+            THEN 'starts' ELSE 'messages' END AS unit,
+          json_extract(fields, '$.activity_messages') AS messages,
+          json_extract(fields, '$.first_s') AS first_s,
+          json_extract(fields, '$.last_s') AS last_s
+   FROM child_latest AS c WHERE latest = 1
+     AND NOT EXISTS (SELECT 1 FROM correlated AS i
+                     WHERE i.db_oid = c.db_oid AND i.program = c.program)
+ ),
+ windows AS (
+   SELECT phase, db_oid, program, db, activity, unit, sum(messages) AS messages,
+          CASE WHEN count(first_s) = count(*) THEN min(first_s) END AS first_s,
+          CASE WHEN count(last_s) = count(*) THEN max(last_s) END AS last_s
+   FROM child_groups GROUP BY phase, db_oid, program, db, activity, unit
+ ),
+ blocks AS (
+   SELECT *,
+          coalesce(nullif(json_extract(fields, '$.db'), ''), 'oid=' || db_oid) AS db,
+          json_extract(fields, '$.first_s') AS first_s,
+          json_extract(fields, '$.last_s') AS last_s,
+          json_extract(fields, '$.to_s') AS next_s,
+          json_extract(fields, '$.messages') AS messages,
+          json_extract(fields, '$.activity_unit') AS unit,
+          json_extract(fields, '$.from_activity') AS activity,
+          CASE
+            WHEN json_extract(fields, '$.from_activity') LIKE 'creating %'
+              THEN substr(json_extract(fields, '$.from_activity'), 10) || ' announcements'
+            WHEN json_extract(fields, '$.from_activity') = 'processing table data'
+              THEN 'table-data announcement'
+            ELSE json_extract(fields, '$.from_activity')
+          END AS label,
+          CASE
+            WHEN json_extract(fields, '$.to_activity') LIKE 'creating %'
+              THEN substr(json_extract(fields, '$.to_activity'), 10) || ' announcements'
+            WHEN json_extract(fields, '$.to_activity') = 'processing table data'
+              THEN 'table-data announcement'
+            ELSE json_extract(fields, '$.to_activity')
+          END AS next_label,
+          CASE WHEN boundary IN ('next_category', 'unreported') THEN ''
+            ELSE ' (correlation stopped: ' || replace(boundary, '_', ' ') || ')' END AS stopped
+   FROM correlated
+ ),
+ ranges AS (
+   SELECT log_line * 2 AS id, phase, program, first_s, last_s,
+          coalesce(json_extract(fields, '$.message_span_s'),
+            CASE WHEN next_s = last_s THEN json_extract(fields, '$.interval_s') END,
+            last_s - first_s) AS seconds,
+          'activity' AS kind, activity <> 'other restore messages' AS detailed,
+          db || ': ' || label || printf(' [%,d %s]', messages,
+            CASE WHEN messages = 1 THEN rtrim(unit, 's') ELSE unit END) || stopped AS operation
+   FROM blocks WHERE timing = 'observed' AND first_s IS NOT NULL AND last_s > first_s
+   UNION ALL
+   SELECT log_line * 2 + 1, phase, program, last_s, next_s,
+          CASE WHEN first_s = last_s THEN json_extract(fields, '$.interval_s')
+            ELSE next_s - last_s END,
+          'gap', activity <> 'other restore messages',
+          db || ': gap after ' || label || '; before ' || next_label
+   FROM blocks WHERE timing = 'observed' AND boundary = 'next_category'
+     AND first_s IS NOT NULL AND next_s > last_s
+ ),
+ overlapping AS (
+   SELECT DISTINCT a.id, a.phase
+   FROM ranges AS a JOIN ranges AS b ON a.phase = b.phase AND a.id <> b.id
+     AND a.first_s < b.last_s AND b.first_s < a.last_s
+ ),
+ budgets AS (
+   SELECT p.phase, p.start_s, coalesce(p.observed_s, p.elapsed_s) AS end_s,
+          p.seconds, min(i.program) AS program, max(i.last_s) AS last_s,
+          (SELECT min(r.first_s) FROM ranges AS r
+            WHERE r.phase = p.phase AND r.detailed) AS detail_s
+   FROM phases AS p JOIN blocks AS i ON i.phase = p.phase
+   WHERE p.seconds > 0 AND p.start_s IS NOT NULL
+     AND NOT EXISTS (SELECT 1 FROM overlapping WHERE phase = p.phase)
+     AND NOT EXISTS (SELECT 1 FROM windows WHERE phase = p.phase)
+     AND NOT EXISTS (SELECT 1 FROM blocks AS u WHERE u.phase IS NULL AND u.program = i.program)
+   GROUP BY p.phase
+   HAVING count(DISTINCT i.program) = 1
+      AND count(i.first_s) = count(*) AND count(i.last_s) = count(*)
+      AND min(i.first_s) >= p.start_s
+      AND max(coalesce(i.next_s, i.last_s)) <= coalesce(p.observed_s, p.elapsed_s)
+      AND sum(i.timing = 'unknown' OR i.boundary NOT IN ('next_category', 'unreported')) = 0
+ ),
+ budget_points AS (
+   SELECT phase, start_s AS point FROM budgets
+   UNION SELECT phase, end_s FROM budgets
+   UNION SELECT phase, last_s FROM budgets
+   UNION SELECT r.phase, r.first_s FROM ranges AS r JOIN budgets AS b ON b.phase = r.phase
+   UNION SELECT r.phase, r.last_s FROM ranges AS r JOIN budgets AS b ON b.phase = r.phase
+ ),
+ slices AS (
+   SELECT phase, point AS first_s,
+          lead(point) OVER (PARTITION BY phase ORDER BY point) AS last_s
+   FROM budget_points
+ ),
+ portions AS (
+   SELECT s.phase,
+          CASE WHEN s.first_s >= b.last_s THEN 'tail'
+            WHEN s.last_s <= b.detail_s AND coalesce(r.detailed, 0) = 0 THEN 'early'
+            WHEN r.id IS NULL THEN 'unclassified' ELSE 'range:' || r.id END AS portion,
+          CASE WHEN s.first_s >= b.last_s THEN 'quiet'
+            WHEN s.last_s <= b.detail_s AND coalesce(r.detailed, 0) = 0 THEN 'activity'
+            WHEN r.id IS NULL THEN 'unclassified' ELSE r.kind END AS kind,
+          CASE WHEN r.detailed AND s.first_s = r.first_s AND s.last_s = r.last_s
+            THEN r.seconds ELSE s.last_s - s.first_s END AS seconds,
+          CASE WHEN s.first_s >= b.last_s
+              THEN 'Silent tail: no further ' || b.program || ' messages before phase completion'
+            WHEN s.last_s <= b.detail_s AND coalesce(r.detailed, 0) = 0
+              THEN 'Earlier ' || CASE b.program WHEN 'pg_restore' THEN 'restore' ELSE 'dump' END || ' activity'
+            WHEN r.id IS NULL THEN 'Unclassified time between child message windows'
+            ELSE r.operation END AS operation
+   FROM slices AS s JOIN budgets AS b ON b.phase = s.phase
+   LEFT JOIN ranges AS r ON r.phase = s.phase AND r.first_s <= s.first_s AND r.last_s >= s.last_s
+   WHERE s.last_s > s.first_s
+ ),
+ ranked_portions AS (
+   SELECT phase, portion, kind, sum(seconds) AS seconds, operation
+   FROM portions GROUP BY phase, portion, kind, operation
+ ),
+ tails AS (
+   SELECT phase, program,
+          CASE WHEN count(last_s) = count(*) THEN max(last_s) END AS last_s
+   FROM (
+     SELECT phase, program, last_s FROM windows
+     UNION ALL
+     SELECT phase, program, last_s FROM blocks
+   ) AS observed_children
+   WHERE NOT EXISTS (SELECT 1 FROM correlated AS i
+                     WHERE i.phase IS NULL AND i.program = observed_children.program)
+   GROUP BY phase, program
+ ),
+ main_details AS (
+   SELECT *,
+          CASE WHEN event = 'main_activity' THEN 'main' ELSE 'files' END AS detail,
+          row_number() OVER (
+            PARTITION BY phase, event = 'main_activity' ORDER BY log_line DESC) AS latest
+   FROM events WHERE event = 'main_activity'
+      OR (event IN ('transfer', 'phase_end') AND json_type(fields, '$.file_messages') = 'integer')
+ ),
  phase_rows AS (
    SELECT CASE WHEN attention THEN 2 ELSE 3 END AS section,
           CASE WHEN attention THEN 0 ELSE -coalesce(p.seconds, 0) END AS sort_seconds,
-          phase AS sort_id, phase, state,
+          phase AS sort_id, 0 AS detail_order, 0 AS detail_seconds, 0 AS detail_id,
+          phase, state AS kind,
           CASE
             WHEN p.seconds IS NOT NULL THEN printf('%.3fs', p.seconds)
             WHEN event <> 'phase_end' AND start_s IS NOT NULL AND c.elapsed_s >= start_s
               THEN printf('%.3fs age', c.elapsed_s - start_s)
             WHEN event = 'phase_end' AND timing = 'coalesced' THEN 'coalesced'
             ELSE 'unknown'
-          END AS observed,
+          END AS elapsed,
           CASE
             WHEN p.seconds IS NULL OR t.seconds IS NULL OR t.seconds = 0 THEN '--'
             WHEN p.seconds > 0 AND 100.0 * p.seconds / t.seconds < 0.1 THEN '<0.1%'
             ELSE printf('%.1f%%', 100.0 * p.seconds / t.seconds)
           END AS share,
+          '' AS subshare,
           message AS operation,
           CASE WHEN state IN ('unfinished', 'unknown') THEN 'warning'
             ELSE log_level END AS level
    FROM phases AS p CROSS JOIN totals AS t CROSS JOIN report_clock AS c
    WHERE attention OR p.seconds IS NOT NULL
+      OR EXISTS (SELECT 1 FROM windows WHERE phase = p.phase)
+      OR EXISTS (SELECT 1 FROM correlated WHERE phase = p.phase)
+      OR EXISTS (SELECT 1 FROM main_details WHERE phase = p.phase)
+ ),
+ child_details AS (
+   SELECT 1 AS detail_order,
+          -r.seconds AS detail_seconds, r.portion AS detail_id, r.phase,
+          '  ' || r.kind AS kind, printf('%.3fs', r.seconds) AS elapsed,
+          CASE WHEN 100.0 * r.seconds / b.seconds < 0.1 THEN '<0.1%'
+            ELSE printf('%.1f%%', 100.0 * r.seconds / b.seconds) END AS subshare,
+          '  ' || r.operation AS operation, 'info' AS level
+   FROM ranked_portions AS r JOIN budgets AS b ON b.phase = r.phase
+   UNION ALL
+   SELECT 1, -r.seconds, r.id, r.phase,
+          CASE WHEN o.id IS NOT NULL THEN '  overlap' ELSE '  window' END,
+          printf('%.3fs', r.seconds), '',
+          '  ' || r.operation || CASE WHEN r.phase IS NULL THEN ' [phase unassigned]' ELSE '' END, 'info'
+   FROM ranges AS r LEFT JOIN overlapping AS o ON o.id = r.id
+   WHERE NOT EXISTS (SELECT 1 FROM budgets WHERE phase = r.phase)
+   UNION ALL
+   SELECT 1, 0, i.log_line, i.phase, '  activity',
+          CASE WHEN i.timing = 'unknown' THEN 'unknown'
+            WHEN i.messages = 1 AND i.boundary <> 'next_category'
+              THEN 'single message' ELSE 'below resolution' END,
+          '', '  ' || i.db || ': ' || i.label || printf(' [%,d %s]', i.messages,
+            CASE WHEN i.messages = 1 THEN rtrim(i.unit, 's') ELSE i.unit END) || i.stopped ||
+          CASE WHEN i.phase IS NULL THEN ' [phase unassigned]' ELSE '' END,
+          i.log_level
+   FROM blocks AS i
+   WHERE NOT EXISTS (SELECT 1 FROM budgets WHERE phase = i.phase)
+     AND NOT EXISTS (SELECT 1 FROM ranges WHERE id IN (i.log_line * 2, i.log_line * 2 + 1))
+   UNION ALL
+   SELECT DISTINCT 1, -1e99, 0, phase,
+          '  note', '', '', '  Overlapping log windows below are NOT additive or SQL runtimes.', 'info'
+   FROM overlapping
+   UNION ALL
+   SELECT 1, -coalesce(w.last_s - w.first_s, 0), w.db_oid, w.phase, '  window',
+          CASE WHEN w.first_s IS NULL OR w.last_s IS NULL THEN 'unknown'
+            WHEN w.last_s > w.first_s THEN printf('%.3fs', w.last_s - w.first_s)
+            WHEN w.messages = 1 THEN 'single message' ELSE 'below resolution' END,
+          '', '  ' || w.db || ': ' || w.activity || printf(' [%,d %s; legacy window]', w.messages, w.unit),
+          'info'
+   FROM windows AS w
+   UNION ALL
+   SELECT 1, -(coalesce(b.observed_s, b.elapsed_s) - t.last_s), 0, t.phase, '  quiet',
+          printf('%.3fs',
+                 coalesce(b.observed_s, b.elapsed_s) - t.last_s), '',
+          '  Silent tail: no further ' || t.program || ' messages before phase completion', 'info'
+   FROM tails AS t JOIN phases AS b ON b.phase = t.phase
+   WHERE b.event = 'phase_end' AND b.timing = 'observed'
+     AND t.last_s IS NOT NULL AND coalesce(b.observed_s, b.elapsed_s) > t.last_s
+     AND NOT EXISTS (SELECT 1 FROM budgets WHERE phase = t.phase)
+   UNION ALL
+   SELECT 1, -json_extract(q.fields, '$.quiet_s'), 0, q.phase, '  quiet',
+          printf('%.3fs', json_extract(q.fields, '$.quiet_s')), '',
+          printf('  No meaningful main/child activity at report %.3fs', q.elapsed_s), 'info'
+   FROM quiet_reports AS q JOIN phases AS b ON b.phase = q.phase
+   WHERE b.event <> 'phase_end' AND q.latest = 1 AND q.event = 'quiet'
+   UNION ALL
+   SELECT 2, 0, d.log_line, d.phase, '  ' || d.detail, '', '',
+          '  ' || CASE WHEN d.detail = 'files'
+            THEN printf('%,d file-operation messages; not completed files.',
+                        json_extract(d.fields, '$.file_messages'))
+            ELSE 'Last main-log detail: ' || d.message END, d.log_level
+   FROM main_details AS d
+   WHERE d.latest = 1
+ ),
+ child_rows AS (
+   SELECT coalesce(p.section, 2) AS section, coalesce(p.sort_seconds, 0) AS sort_seconds,
+          d.phase AS sort_id, d.detail_order, d.detail_seconds, d.detail_id,
+          d.phase, d.kind, d.elapsed, '' AS share, d.subshare, d.operation, d.level
+   FROM child_details AS d LEFT JOIN phase_rows AS p ON p.phase = d.phase
  ),
  view_rows AS (
-   SELECT 0 AS section, 0 AS sort_seconds, log_line AS sort_id, NULL AS phase,
-          upper(result) AS state,
-          '' AS observed, '' AS share,
+   SELECT 0 AS section, 0 AS sort_seconds, log_line AS sort_id,
+          0 AS detail_order, 0 AS detail_seconds, 0 AS detail_id, NULL AS phase,
+          upper(result) AS kind,
+          '' AS elapsed, '' AS share, '' AS subshare,
           message AS operation, log_level AS level
    FROM outcome WHERE log_level IN ('warning', 'error', 'critical', 'fatal')
    UNION ALL
-   SELECT 1, 0, log_line, phase,
+   SELECT 1, 0, log_line, 0, 0, 0, phase,
           CASE WHEN event = 'attached' THEN 'attached' ELSE log_level END,
-          '', '', message, log_level
+          '', '', '', message, log_level
    FROM alerts
    UNION ALL
    SELECT * FROM phase_rows
+   UNION ALL
+   SELECT * FROM child_rows
  ),
  display_rows AS (
    SELECT * FROM view_rows
    UNION ALL
-   SELECT 0, 0, 0, NULL, 'unmeasured', '', '',
+   SELECT 0, 0, 0, 0, 0, 0, NULL, 'unmeasured', '', '', '',
           'No measured phase durations in these records.', 'info'
    WHERE NOT EXISTS (SELECT 1 FROM view_rows)
  )
  SELECT CASE WHEN phase IS NULL THEN '' ELSE printf('#%02d', phase) END AS phase,
-        state, observed, share, operation,
+        kind, elapsed, share, subshare AS "of phase", operation,
         json_object('columns', json_object(
           'phase', json_object('text-align', 'start', 'color', 'semantic()'),
-          'state', json_object(
+          'kind', json_object(
             'text-align', 'start',
             'color', CASE
               WHEN level IN ('error', 'critical', 'fatal') THEN '#ff5f5f'
               WHEN level = 'warning' THEN '#d7af00'
-              WHEN state = 'open' THEN '#5fafff'
+              WHEN kind = 'open' THEN '#5fafff'
               ELSE 'semantic()' END),
-          'observed', json_object('text-align', 'end'),
+          'elapsed', json_object('text-align', 'end'),
           'share', json_object('text-align', 'end'),
+          'of phase', json_object('text-align', 'end'),
           'operation', json_object('text-align', 'start')
         )) AS __lnav_style__
  FROM display_rows
- ORDER BY section, sort_seconds, sort_id;
+ ORDER BY section, sort_seconds, sort_id, detail_order, detail_seconds, detail_id;
 
-:alt-msg F5: refresh; q: raw. Shares = measured phase time, not progress; untimed omitted; age = last report.
+:alt-msg F5: refresh; q: raw. Share = measured phases; of phase = non-overlapping elapsed portions, NOT SQL runtimes. Windows may overlap.
