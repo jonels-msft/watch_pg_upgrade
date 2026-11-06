@@ -5,6 +5,13 @@ A read-only, log-based progress observer for pg_upgrade.
 Watches an **existing** upgrade's logs. Never launches pg_upgrade, connects to a
 database, or signals PostgreSQL.
 
+**Timing requires live observation.** Run the watcher alongside pg_upgrade,
+ideally starting before any upgrade output is written. It records when it
+observes new log data; pg_upgrade's ordinary progress logs do not save those
+arrival timestamps. These are observation times, not SQL execution timestamps.
+Starting the watcher on completed logs can summarize messages and counts, but
+cannot reconstruct phase durations or silent intervals.
+
 ## TL;DR
 
 Requires Python 3.8+ on Linux/Unix; no pip packages. lnav 0.14.1 is optional.
@@ -24,6 +31,9 @@ lnav -I lnav -f lnav/progress.lnav "$HOME/pg-upgrade-watch.log"
 
 **F5** refreshes; **q** returns to raw logs. For Snap, replace `lnav` with
 `snap run lnav`. Keep each upgrade in a separate output file.
+
+Save the watcher output during the upgrade to analyze its recorded timings
+later in lnav. No separate timestamping or capture helper is required.
 
 ## Essentials
 
