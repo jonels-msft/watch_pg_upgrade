@@ -13,6 +13,7 @@
           CASE WHEN json_type(fields, '$.phase') = 'integer'
             THEN json_extract(fields, '$.phase') END AS phase,
           json_extract(fields, '$.status') AS status,
+          json_extract(fields, '$.basis') AS basis,
           json_extract(fields, '$.timing') AS timing,
           json_extract(fields, '$.result') AS result,
           json_extract(fields, '$.elapsed_s') AS elapsed_s,
@@ -259,7 +260,7 @@
             WHEN state IN ('open', 'unfinished') THEN ' [completion not observed]'
             WHEN state <> 'ok' THEN ' [' || state || ']'
             ELSE '' END AS operation,
-          log_level AS level, 'log' AS basis
+          log_level AS level, p.basis
    FROM phases AS p CROSS JOIN totals AS t CROSS JOIN report_clock AS c
    WHERE attention OR p.seconds IS NOT NULL
       OR EXISTS (SELECT 1 FROM windows WHERE phase = p.phase)
@@ -331,7 +332,7 @@
             THEN printf('%,d file-operation messages; not completed files.',
                         json_extract(d.fields, '$.file_messages'))
             ELSE 'Last main-log detail: ' || d.message END, d.log_level,
-          CASE WHEN d.detail = 'main' THEN 'log' ELSE 'derived' END
+          CASE WHEN d.detail = 'main' THEN d.basis ELSE 'derived' END
    FROM main_details AS d
    WHERE d.latest = 1
  ),
@@ -346,7 +347,7 @@
           0 AS detail_order, 0 AS detail_seconds, 0 AS detail_id, NULL AS phase,
           result AS kind,
           '' AS elapsed, '' AS share, '' AS subshare,
-          message AS operation, log_level AS level, 'derived' AS basis
+          message AS operation, log_level AS level, basis
    FROM outcome WHERE log_level IN ('warning', 'error', 'critical', 'fatal')
    UNION ALL
    SELECT 1, 0, log_line, 0, 0, 0, phase,
@@ -357,15 +358,7 @@
             WHEN 'error' THEN 'Error: ' || message
             WHEN 'observer_error' THEN 'Observer error: ' || message
             ELSE message
-          END, log_level,
-          CASE
-            WHEN event IN ('context', 'notice') THEN 'context'
-            WHEN event IN ('main_activity', 'last_activity', 'error')
-              OR (event = 'warning' AND json_extract(fields, '$.component') IS NOT 'parser'
-                  AND (json_type(fields, '$.status') = 'text'
-                       OR json_type(fields, '$.program') = 'text')) THEN 'log'
-            ELSE 'derived'
-          END
+          END, log_level, basis
    FROM alerts
    UNION ALL
    SELECT * FROM phase_rows
@@ -379,26 +372,14 @@
           'No measured phase durations in these records.', 'info', 'derived'
    WHERE NOT EXISTS (SELECT 1 FROM view_rows)
  ),
- flagged AS (
-   SELECT *,
-          CASE
-            WHEN level IN ('error', 'critical', 'fatal')
-              OR kind IN ('error', 'critical', 'fatal') OR kind LIKE 'failed%' THEN 'error'
-            WHEN level = 'warning'
-              OR kind IN ('notice', 'warning', 'unfinished', 'exit_unverified',
-                          'incomplete', 'missing_banner') THEN 'warn'
-            ELSE ''
-          END AS alert
-   FROM display_rows
- ),
  styled AS (
    SELECT *,
-          CASE alert
-            WHEN 'warn' THEN '{"color":"#d7af00"}'
-            WHEN 'error' THEN '{"color":"#ff5f5f"}'
+          CASE
+            WHEN level = 'warning' THEN '{"color":"#d7af00"}'
+            WHEN level IN ('error', 'critical', 'fatal') THEN '{"color":"#ff5f5f"}'
             ELSE '{}'
           END AS row_color
-   FROM flagged
+   FROM display_rows
  )
  SELECT CASE WHEN phase IS NULL THEN '' ELSE printf('#%02d', phase) END AS phase,
         elapsed, share, subshare AS "of phase", operation, basis,

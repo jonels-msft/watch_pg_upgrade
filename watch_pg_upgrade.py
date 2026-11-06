@@ -249,7 +249,7 @@ class Timeline(PhaseTimer):
             if status in ("warning", "notice"):
                 self.last_warning = message
                 self.alerts.append((seconds, "warning", message,
-                                    {"phase": len(self.phases), "status": status}))
+                                    {"phase": len(self.phases), "status": status, "basis": "log"}))
         elif kind == "TEXT":
             text = message.strip()
             if text.startswith("Performing Consistency Checks") and self.phases:
@@ -353,10 +353,10 @@ class Timeline(PhaseTimer):
                 child["error"] = line
                 self.failure = f"Database OID {oid}: {line}"
                 self.alerts.append((seconds, "error", self.failure,
-                                    {"db_oid": int(oid), "program": child["program"]}))
+                                    {"db_oid": int(oid), "program": child["program"], "basis": "log"}))
             if line.startswith(("pg_restore: warning:", "pg_dump: warning:")):
                 self.alerts.append((seconds, "warning", f"Database OID {oid}: {line}",
-                                    {"db_oid": int(oid), "program": child["program"]}))
+                                    {"db_oid": int(oid), "program": child["program"], "basis": "log"}))
             if line.startswith("pg_restore: creating "):
                 kind = line[len("pg_restore: creating "):].split(' "', 1)[0]
                 child["counts"][kind] += 1
@@ -629,10 +629,10 @@ class EventReporter:
         self.eta_at = float("-inf")
         self.banner = None
 
-    def write(self, seconds, event, message, *, level="info", stream=None, **fields):
+    def write(self, seconds, event, message, *, basis, level="info", stream=None, **fields):
         stamp = (self.origin + timedelta(seconds=self.now)).isoformat(timespec="milliseconds")
         record = {"time": stamp.replace("+00:00", "Z"), "level": level,
-                  "elapsed_s": self.now, "event": event}
+                  "elapsed_s": self.now, "event": event, "basis": basis}
         if seconds != self.now:
             record["observed_s"] = seconds
         record.update((key, value) for key, value in fields.items() if value is not None)
@@ -642,29 +642,30 @@ class EventReporter:
 
     def begin(self, model):
         self.write(0, "observer_start", "pg_upgrade timeline; read-only log observer",
-                   schema=1, mode=self.mode, time_basis=self.time_basis, source=self.source)
+                   basis="derived", schema=1, mode=self.mode,
+                   time_basis=self.time_basis, source=self.source)
         self.write(0, "notice", "Times are observations, not SQL timings. Starts != completions; "
-                   "per-database completion is unreported.")
+                   "per-database completion is unreported.", basis="context")
         self.write(0, "notice", "Silence does NOT prove a stall or health. "
-                   "Ctrl-C stops only this observer.")
+                   "Ctrl-C stops only this observer.", basis="context")
         if not self.references and not (model.banner or model.failure or model.exit_code is not None):
             self.write(0, "eta", "ETA unavailable: no comparable reference supplied.",
-                       available=False, reason="no_reference")
+                       basis="derived", available=False, reason="no_reference")
         if not model.timing_complete:
             self.write(0, "attached", "LATE ATTACH: earlier timings unknown; "
                        "later fully observed phases remain timed.",
-                       historical_phases=len(model.phases), timing="unknown")
+                       basis="derived", historical_phases=len(model.phases), timing="unknown")
             if model.active:
                 self.stage(0, model.groups[-1])
                 self.write(0, "phase_active", model.active["name"],
-                           phase=len(model.phases), timing="unknown")
+                           basis="log", phase=len(model.phases), timing="unknown")
         self.started = True
 
     def stage(self, seconds, group):
         if group != self.group and group is not None:
             following = GROUPS[group + 1] if group + 1 < len(GROUPS) else None
             remaining = len(GROUPS) - group - 1
-            self.write(seconds, "stage", GROUPS[group], stage=group + 1,
+            self.write(seconds, "stage", GROUPS[group], basis="derived", stage=group + 1,
                        remaining_groups=remaining, conditional=True, next=following)
             self.group = group
 
@@ -680,7 +681,7 @@ class EventReporter:
                 index += 1
                 seconds, kind, _ = events[index]
             if kind == "START":
-                self.write(seconds, "phase_start", phase["name"], phase=number + 1,
+                self.write(seconds, "phase_start", phase["name"], basis="log", phase=number + 1,
                            timing="observed" if phase["timing_known"] else "unknown")
             else:
                 known = phase["timing_known"]
@@ -694,10 +695,10 @@ class EventReporter:
                     fields["file_messages"] = model.file_activity[number]["count"]
                 level = ("info" if phase["status"] == "ok" else
                          "warning" if phase["status"] in ("notice", "warning") else "error")
-                self.write(seconds, "phase_end", phase["name"], level=level, **fields)
+                self.write(seconds, "phase_end", phase["name"], basis="log", level=level, **fields)
             if group is None:
                 self.write(seconds, "warning", "Unclassified phase: expected stage sequence may be incomplete.",
-                           level="warning", phase=number + 1)
+                           basis="derived", level="warning", phase=number + 1)
             index += 1
 
     def activity(self, model, now, *, final=False):
@@ -740,7 +741,7 @@ class EventReporter:
                 if len(detail) > 160:
                     detail = detail[:157] + "..."
                 counts = counts_fields(child["counts"]) if program == "pg_restore" else {}
-                self.write(window["seen"], "db_activity", detail, phase=number,
+                self.write(window["seen"], "db_activity", detail, basis="derived", phase=number,
                            db=child["name"], db_oid=int(oid), program=program,
                            source=child["source"], activity=label,
                            activity_messages=window["messages"],
@@ -753,7 +754,7 @@ class EventReporter:
         if deferred:
             self.write(now, "activity_deferred", "Additional changed database logs; "
                        "details deferred, errors are never hidden.",
-                       databases=deferred)
+                       basis="derived", databases=deferred)
         for number, detail in model.main_activity.items():
             previous = self.sent_main.get(number)
             ended = "end_seconds" in model.phases[number - 1]
@@ -762,7 +763,7 @@ class EventReporter:
                              not force and now - previous[1] < self.activity_interval):
                 continue
             self.write(detail["last"], "main_activity", detail["message"][:160],
-                       phase=number, source="main", messages=detail["count"])
+                       basis="log", phase=number, source="main", messages=detail["count"])
             self.sent_main[number] = (detail["count"], now)
         number = len(model.phases) - 1
         activity = model.file_activity.get(number) if model.active else None
@@ -771,7 +772,7 @@ class EventReporter:
             if previous is None or (activity["count"] != previous[0]
                                     and now - previous[1] >= self.activity_interval):
                 self.write(activity["last"], "transfer", "File-operation messages, not completed files or bytes",
-                           phase=number + 1, file_messages=activity["count"])
+                           basis="derived", phase=number + 1, file_messages=activity["count"])
                 self.sent_files[number] = (activity["count"], now)
         restore = next((i for i in reversed(range(len(model.phases)))
                         if model.phases[i]["name"] == RESTORE), None)
@@ -781,7 +782,7 @@ class EventReporter:
                 counts.update(child["counts"])
             if counts and counts != self.sent_restore_totals:
                 self.write(now, "restore_totals", "Object-start messages, not completions",
-                           phase=restore + 1, **counts_fields(counts))
+                           basis="derived", phase=restore + 1, **counts_fields(counts))
                 self.sent_restore_totals = counts
 
     def quiet(self, model, now, children):
@@ -802,7 +803,7 @@ class EventReporter:
         elif activity > self.last_activity:
             if self.last_quiet is not None:
                 self.write(activity, "resumed", "Meaningful log activity resumed",
-                           phase=len(model.phases) if model.active else None,
+                           basis="derived", phase=len(model.phases) if model.active else None,
                            quiet_s=activity - self.last_activity)
             self.last_quiet = None
         self.last_activity = activity
@@ -820,16 +821,16 @@ class EventReporter:
                       "source": child["source"]}
         elif model.last_detail and model.last_detail_s == model.parent_activity:
             detail = {"last_message": model.last_detail[:160], "source": "main"}
-        self.write(now, "quiet", label, quiet_s=now - activity,
+        self.write(now, "quiet", label, basis="derived", quiet_s=now - activity,
                    phase=len(model.phases) if model.active else None,
                    bytes_ago_s=now - raw if raw > activity else None, **detail)
         if self.last_quiet is None:
             if children:
                 oid, child = max(children.items(), key=lambda item: item[1]["activity_last"])
                 self.write(child["activity_last"], "last_activity", child["message"][:160],
-                           phase=len(model.phases), db=child["name"], db_oid=int(oid))
+                           basis="log", phase=len(model.phases), db=child["name"], db_oid=int(oid))
             self.write(now, "context", quiet_context(model, children),
-                       phase=len(model.phases) if model.active else None)
+                       basis="context", phase=len(model.phases) if model.active else None)
         self.last_quiet = now
 
     def correlations(self, model, now, final):
@@ -852,7 +853,7 @@ class EventReporter:
             elapsed = None if first is None or stop is None else stop - first
             timing = ("unknown" if elapsed is None else
                       "observed" if round(elapsed, 3) > 0 else "coalesced")
-            fields = dict(interval, timing=timing, basis="log_observations")
+            fields = dict(interval, timing=timing)
             fields["activity_unit"] = ("starts" if interval["program"] == "pg_restore"
                                        and interval["from_activity"].startswith("creating ")
                                        else "messages")
@@ -866,7 +867,7 @@ class EventReporter:
             else:
                 message = "First -> last " + label
             self.write(stop if stop is not None else now, "db_interval", message,
-                       db=child["name"], **fields)
+                       basis="derived", db=child["name"], **fields)
             if interval["boundary"] == "unreported":
                 self.sent_intervals[key] = (signature, now)
             else:
@@ -876,13 +877,14 @@ class EventReporter:
         result = model.result()
         level = ("error" if result == "failed" else
                  "warning" if result in ("incomplete", "missing_banner", "exit_unverified") else "info")
-        self.write(now, "outcome", model.outcome(), level=level, result=result,
+        self.write(now, "outcome", model.outcome(), basis="derived", level=level, result=result,
                    exit_code=model.exit_code, final=final)
 
     def summary(self, model, now):
         self.outcome(model, now, final=True)
         if model.active:
-            self.write(now, "phase_unfinished", model.active["name"], phase=len(model.phases))
+            self.write(now, "phase_unfinished", model.active["name"],
+                       basis="log", level="warning", phase=len(model.phases))
         for index, name in enumerate(GROUPS):
             phases = [p for p, group in zip(model.phases, model.groups) if group == index]
             if not phases:
@@ -892,7 +894,7 @@ class EventReporter:
             seconds = sum(p["duration_seconds"] for p in timed)
             timing = ("observed" if seconds else "coalesced") if timed else "unknown"
             warnings = sum(p.get("status") in ("notice", "warning") for p in phases)
-            self.write(now, "stage_summary", name, stage=index + 1,
+            self.write(now, "stage_summary", name, basis="derived", stage=index + 1,
                        complete=len(complete), phases=len(phases), timing=timing,
                        labelled_s=seconds if seconds else None,
                        untimed=len(complete) - len(timed), warnings=warnings or None)
@@ -905,15 +907,16 @@ class EventReporter:
         if not self.started:
             self.begin(model)
         if model.child_location and model.child_location != self.location:
-            self.write(now, "child_logs", model.child_location)
+            self.write(now, "child_logs", model.child_location, basis="derived")
             self.location = model.child_location
         self.phase_events(model)
         self.activity(model, now, final=final)
         self.correlations(model, now, final)
         alerts, model.alerts = model.alerts, []
         if model.failure:
-            alerts.append((now, "error", model.failure, {}))
-        alerts.extend((now, "warning", issue, {"component": "parser"}) for issue in model.issues)
+            alerts.append((now, "error", model.failure, {"basis": "log"}))
+        alerts.extend((now, "warning", issue, {"component": "parser", "basis": "derived"})
+                      for issue in model.issues)
         for seconds, level, alert, fields in alerts:
             if (level, alert) not in self.alerted:
                 self.write(seconds, level, alert, level=level, **fields)
@@ -936,7 +939,7 @@ class EventReporter:
             eta, fields = estimate_details(model, now, self.references)
             state = (fields["available"], fields.get("reason"))
             if state != self.eta_state or now - self.eta_at >= self.heartbeat:
-                self.write(now, "eta", eta, **fields)
+                self.write(now, "eta", eta, basis="derived", **fields)
                 self.eta_state, self.eta_at = state, now
 
 
@@ -1235,14 +1238,14 @@ def main(argv=None):
     except (OSError, ValueError, KeyError, TypeError, RuntimeError, OverflowError) as error:
         if not args.replay:
             reporter.now = time.monotonic() - reporter.clock_start
-        reporter.write(reporter.now, "observer_error", str(error), level="error",
+        reporter.write(reporter.now, "observer_error", str(error), basis="derived", level="error",
                        stream=sys.stderr, observer_exit_code=2)
         return 2
     except KeyboardInterrupt:
         if not args.replay:
             reporter.now = time.monotonic() - reporter.clock_start
         reporter.write(reporter.now, "observer_stop", "Observer stopped; pg_upgrade was not signalled.",
-                       level="warning", stream=sys.stderr, observer_exit_code=130)
+                       basis="derived", level="warning", stream=sys.stderr, observer_exit_code=130)
         return 130
 
 

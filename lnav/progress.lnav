@@ -9,41 +9,18 @@
           json_extract(fields, '$.event') AS event,
           json_extract(fields, '$.phase') AS phase,
           json_extract(fields, '$.stage') AS stage,
+          json_extract(fields, '$.basis') AS basis,
           json_extract(logfmt2json(log_text), '$.msg') AS message
    FROM logfmt_log
  ),
- flagged AS (
-   SELECT *,
-          CASE
-            WHEN log_level IN ('error', 'critical', 'fatal')
-              OR (event = 'phase_end' AND (json_extract(fields, '$.status') = 'fatal'
-                  OR json_extract(fields, '$.status') LIKE 'failed%'))
-              OR (event = 'outcome' AND json_extract(fields, '$.result') = 'failed') THEN 'error'
-            WHEN log_level = 'warning' OR event = 'phase_unfinished'
-              OR (event = 'phase_end' AND json_extract(fields, '$.status') IN ('notice', 'warning'))
-              OR (event = 'outcome' AND json_extract(fields, '$.result') IN
-                  ('exit_unverified', 'incomplete', 'missing_banner')) THEN 'warn'
-            ELSE ''
-          END AS alert,
-          CASE
-            WHEN event IN ('context', 'notice') THEN 'context'
-            WHEN event IN ('phase_start', 'phase_end', 'phase_active', 'phase_unfinished',
-                           'main_activity', 'last_activity', 'error')
-              OR (event = 'warning' AND json_extract(fields, '$.component') IS NOT 'parser'
-                  AND (json_type(fields, '$.status') = 'text'
-                       OR json_type(fields, '$.program') = 'text')) THEN 'log'
-            ELSE 'derived'
-          END AS basis
-   FROM events
- ),
  styled AS (
    SELECT *,
-          CASE alert
-            WHEN 'warn' THEN '{"color":"#d7af00"}'
-            WHEN 'error' THEN '{"color":"#ff5f5f"}'
+          CASE
+            WHEN log_level = 'warning' THEN '{"color":"#d7af00"}'
+            WHEN log_level IN ('error', 'critical', 'fatal') THEN '{"color":"#ff5f5f"}'
             ELSE '{}'
           END AS row_color
-   FROM flagged
+   FROM events
  )
  SELECT printf('%.1fs', json_extract(fields, '$.elapsed_s')) AS report,
         CASE WHEN phase IS NOT NULL THEN printf('#%02d', phase) ELSE '' END AS phase,
