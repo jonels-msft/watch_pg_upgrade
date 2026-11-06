@@ -15,7 +15,10 @@ cannot reconstruct phase durations or silent intervals.
 ## TL;DR
 
 Requires Python 3.8+ on Linux/Unix; no pip packages. lnav 0.14.1 is optional.
-Run from this checkout, selecting the exact upgrade run's log directory:
+Run from this checkout, selecting the exact upgrade run's log directory under
+the **new cluster's data directory**, not the old cluster's. In this example,
+`--main-log` selects pg_upgrade's own log file; `--log-dir` selects its containing
+directory so the watcher can find the per-database `pg_dump`/`pg_restore` logs.
 
 ```sh
 # Terminal 1: observe and save readable logfmt
