@@ -384,9 +384,8 @@ class Timeline(PhaseTimer):
     def observe_interval(self, child, oid, message, seconds, historical):
         program = child["program"]
         label = activity_label(message)
-        if program == "pg_restore" and label not in (
-            "creating TABLE", "creating CONSTRAINT", "creating INDEX", "processing table data",
-            "error", "warning",
+        if program == "pg_restore" and not label.startswith("creating ") and label not in (
+            "processing table data", "error", "warning",
         ):
             label = "other restore messages"
         number = self.child_phase(program, seconds)

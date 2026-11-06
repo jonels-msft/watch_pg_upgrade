@@ -93,21 +93,42 @@
    FROM events WHERE event = 'db_activity'
      AND json_type(fields, '$.activity_messages') = 'integer'
  ),
+ window_streams AS (
+   SELECT DISTINCT c.db_oid, c.program
+   FROM child_latest AS c
+   WHERE c.latest = 1 AND c.program = 'pg_restore' AND c.activity LIKE 'creating %'
+     AND json_extract(c.fields, '$.last_s') > json_extract(c.fields, '$.first_s')
+     AND NOT EXISTS (
+       SELECT 1 FROM correlated AS i
+       WHERE i.db_oid = c.db_oid AND i.program = c.program AND i.phase IS c.phase
+         AND json_extract(i.fields, '$.source') IS json_extract(c.fields, '$.source')
+         AND json_extract(i.fields, '$.from_activity') = c.activity
+     )
+     AND EXISTS (
+       SELECT 1 FROM correlated AS i
+       WHERE i.db_oid = c.db_oid AND i.program = c.program AND i.phase IS c.phase
+         AND json_extract(i.fields, '$.source') IS json_extract(c.fields, '$.source')
+         AND json_extract(i.fields, '$.from_activity') = 'other restore messages'
+         AND json_extract(i.fields, '$.first_s') <= json_extract(c.fields, '$.first_s')
+         AND json_extract(i.fields, '$.last_s') >= json_extract(c.fields, '$.last_s')
+     )
+ ),
  child_groups AS (
    SELECT phase, db_oid, program,
           coalesce(nullif(json_extract(fields, '$.db'), ''), 'oid=' || db_oid) AS db,
-          CASE WHEN program = 'pg_restore' AND activity NOT IN
-                 ('creating TABLE', 'creating CONSTRAINT', 'creating INDEX', 'processing table data')
+          CASE WHEN program = 'pg_restore' AND activity NOT LIKE 'creating %'
+                 AND activity <> 'processing table data'
             THEN 'other restore messages' ELSE activity END AS activity,
-          CASE WHEN program = 'pg_restore'
-                 AND activity IN ('creating TABLE', 'creating CONSTRAINT', 'creating INDEX')
+          CASE WHEN program = 'pg_restore' AND activity LIKE 'creating %'
             THEN 'starts' ELSE 'messages' END AS unit,
           json_extract(fields, '$.activity_messages') AS messages,
           json_extract(fields, '$.first_s') AS first_s,
           json_extract(fields, '$.last_s') AS last_s
    FROM child_latest AS c WHERE latest = 1
-     AND NOT EXISTS (SELECT 1 FROM correlated AS i
-                     WHERE i.db_oid = c.db_oid AND i.program = c.program)
+     AND (NOT EXISTS (SELECT 1 FROM correlated AS i
+                       WHERE i.db_oid = c.db_oid AND i.program = c.program)
+          OR EXISTS (SELECT 1 FROM window_streams AS w
+                     WHERE w.db_oid = c.db_oid AND w.program = c.program))
  ),
  windows AS (
    SELECT phase, db_oid, program, db, activity, unit, sum(messages) AS messages,
@@ -140,7 +161,9 @@
           END AS next_label,
           CASE WHEN boundary IN ('next_category', 'unreported') THEN ''
             ELSE ' (correlation stopped: ' || replace(boundary, '_', ' ') || ')' END AS stopped
-   FROM correlated
+   FROM correlated AS i
+   WHERE NOT EXISTS (SELECT 1 FROM window_streams AS w
+                     WHERE w.db_oid = i.db_oid AND w.program = i.program)
  ),
  ranges AS (
    SELECT log_line * 2 AS id, phase, program, first_s, last_s,
@@ -174,7 +197,7 @@
    WHERE p.seconds > 0 AND p.start_s IS NOT NULL
      AND NOT EXISTS (SELECT 1 FROM overlapping WHERE phase = p.phase)
      AND NOT EXISTS (SELECT 1 FROM windows WHERE phase = p.phase)
-     AND NOT EXISTS (SELECT 1 FROM blocks AS u WHERE u.phase IS NULL AND u.program = i.program)
+     AND NOT EXISTS (SELECT 1 FROM correlated AS u WHERE u.phase IS NULL AND u.program = i.program)
    GROUP BY p.phase
    HAVING count(DISTINCT i.program) = 1
       AND count(i.first_s) = count(*) AND count(i.last_s) = count(*)
@@ -302,11 +325,20 @@
           'info', 'context'
    FROM overlapping
    UNION ALL
+   SELECT DISTINCT 1, -1e99, 1, phase,
+          '  note', '', '',
+          '  Category windows span first to last messages; may overlap and are NOT additive or SQL runtimes.',
+          'info', 'context'
+   FROM windows
+   UNION ALL
    SELECT 1, -coalesce(w.last_s - w.first_s, 0), w.db_oid, w.phase, '  window',
           CASE WHEN w.first_s IS NULL OR w.last_s IS NULL THEN 'unknown'
             WHEN w.last_s > w.first_s THEN printf('%.3fs', w.last_s - w.first_s)
             WHEN w.messages = 1 THEN 'single message' ELSE 'below resolution' END,
-          '', '  ' || w.db || ': ' || w.activity || printf(' [%,d %s; legacy window]', w.messages, w.unit),
+          '', '  ' || w.db || ': ' ||
+          CASE WHEN w.activity LIKE 'creating %' THEN substr(w.activity, 10) || ' announcements'
+            WHEN w.activity = 'processing table data' THEN 'table-data announcement'
+            ELSE w.activity END || printf(' [%,d %s; category window]', w.messages, w.unit),
           'info', 'derived'
    FROM windows AS w
    UNION ALL
